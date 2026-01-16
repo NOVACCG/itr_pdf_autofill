@@ -80,13 +80,25 @@ class TabManager:
         tab = tk.Frame(self.header, bg=self.colors["normal"], bd=1, relief="solid")
         tab.pack(side="left", padx=(0, 6), pady=2)
 
-        icon_holder = tk.Label(tab, text="", bg=self.colors["normal"])
-        icon_holder.pack(side="left", padx=(self.padding["x"], 4), pady=self.padding["y"])
-
-        label = tk.Label(tab, text=title, bg=self.colors["normal"], font=self.title_font)
-        label.pack(side="left", pady=self.padding["y"])
+        tab.columnconfigure(0, weight=0)
+        tab.columnconfigure(1, weight=1)
+        tab.columnconfigure(2, weight=0)
 
         close_btn = None
+        if closable:
+            icon_holder = tk.Label(tab, text="", bg=self.colors["normal"])
+            icon_holder.grid(row=0, column=0, padx=(self.padding["x"], 4), pady=self.padding["y"])
+
+            label = tk.Label(tab, text=title, bg=self.colors["normal"], font=self.title_font, anchor="center")
+            label.grid(row=0, column=1, sticky="ew", pady=self.padding["y"])
+        else:
+            icon_holder = tk.Label(tab, text="", bg=self.colors["normal"], width=4)
+            icon_holder.grid(row=0, column=0, padx=(self.padding["x"], 4), pady=self.padding["y"])
+
+            label = tk.Label(tab, text=title, bg=self.colors["normal"], font=self.title_font, anchor="center")
+            label.grid(row=0, column=1, sticky="ew", pady=self.padding["y"])
+            close_btn = tk.Label(tab, text="", bg=self.colors["normal"], width=4)
+            close_btn.grid(row=0, column=2, padx=(4, self.padding["x"]), pady=self.padding["y"])
         if closable:
             close_btn = tk.Label(
                 tab,
@@ -99,7 +111,7 @@ class TabManager:
                 font=self.title_font,
                 cursor="hand2",
             )
-            close_btn.pack(side="right", padx=(6, self.padding["x"]), pady=2)
+            close_btn.grid(row=0, column=2, padx=(6, self.padding["x"]), pady=2)
             close_btn.bind("<Button-1>", lambda _e, k=key: self.close_tab(k))
 
         def on_enter(_event=None):

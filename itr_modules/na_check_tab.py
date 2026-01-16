@@ -36,6 +36,7 @@ from itr_modules.shared.paths import (
     get_batch_id,
     open_in_file_explorer,
 )
+from itr_modules.shared.pdf_utils import fit_text_to_box
 
 # -------------------------
 # 输出目录（统一 output/，按模块/输出类型/批次）
@@ -195,6 +196,10 @@ def is_pure_int(s: str) -> bool:
 
 def rect_between_lines(x0, x1, y0, y1, pad=0.6):
     return fitz.Rect(x0 + pad, y0 + pad, x1 - pad, y1 - pad)
+
+
+def _label_rect_above(cell: fitz.Rect, height: float = 8.0) -> fitz.Rect:
+    return fitz.Rect(cell.x0, cell.y0 - height, cell.x1, cell.y0)
 
 
 def _unique_sorted_x_from_verticals(verticals) -> list[float]:
@@ -466,6 +471,8 @@ class NACheckTab(ttk.Frame):
 
         self.btn_tick = ttk.Button(top, text="打勾（NA）", command=self.tick_na_placeholder)
         self.btn_tick.pack(side=tk.LEFT, padx=(0, 8))
+
+        ttk.Button(top, text="打开导出文件夹", command=self.open_filled_folder).pack(side=tk.LEFT, padx=(0, 8))
 
         ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
 
@@ -760,6 +767,9 @@ class NACheckTab(ttk.Frame):
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    def open_filled_folder(self) -> None:
+        open_in_file_explorer(self._module_root() / "filled")
+
     def _report_root(self) -> Path:
         path = REPORT_ROOT / REPORT_MODULE_NAME
         path.mkdir(parents=True, exist_ok=True)
@@ -1031,38 +1041,48 @@ class NACheckTab(ttk.Frame):
                     rr = entry["no_cell"]
                     page.draw_rect(rr, color=(0, 0, 1), width=2.0)
                     if debug_labels:
-                        page.insert_text((rr.x0 + 1, rr.y0 - 1), "NO", fontsize=6)
+                        fit_text_to_box(page, _label_rect_above(rr), "NO", {"max_font_size": 6, "min_font_size": 3})
 
                 if entry.get("desc_cell"):
                     rr = entry["desc_cell"]
                     page.draw_rect(rr, color=(0, 0, 1), width=2.0)
                     if debug_labels:
-                        page.insert_text((rr.x0 + 1, rr.y0 - 1), "DESC", fontsize=6)
+                        fit_text_to_box(page, _label_rect_above(rr), "DESC", {"max_font_size": 6, "min_font_size": 3})
 
                 # OK/NA/PL：蓝框
                 for k, rr in (entry.get("okna") or {}).items():
                     page.draw_rect(rr, color=(0, 0, 1), width=2.0)
                     if debug_labels:
-                        page.insert_text((rr.x0 + 1, rr.y0 - 1), k, fontsize=6)
+                        fit_text_to_box(page, _label_rect_above(rr), k, {"max_font_size": 6, "min_font_size": 3})
 
                 # EX 列：橙框
                 for name, rr in (entry.get("ex_cells") or []):
                     page.draw_rect(rr, color=(1, 0.5, 0), width=2.0)
                     if debug_labels:
-                        page.insert_text((rr.x0 + 1, rr.y0 - 1), name, fontsize=6)
+                        fit_text_to_box(page, _label_rect_above(rr), name, {"max_font_size": 6, "min_font_size": 3})
 
                 # Ex Concept：紫（label）+ 红（值）
                 if entry.get("ex_label"):
                     rr = entry["ex_label"]
                     page.draw_rect(rr, color=(0.6, 0, 0.8), width=2.0)
                     if debug_labels:
-                        page.insert_text((rr.x0 + 1, rr.y0 - 1), "EX_CONCEPT", fontsize=6)
+                        fit_text_to_box(
+                            page,
+                            _label_rect_above(rr),
+                            "EX_CONCEPT",
+                            {"max_font_size": 6, "min_font_size": 3},
+                        )
 
                 if entry.get("ex_value"):
                     rr = entry["ex_value"]
                     page.draw_rect(rr, color=(1, 0, 0), width=2.0)
                     if debug_labels:
-                        page.insert_text((rr.x0 + 1, rr.y0 - 1), "EX_VALUE", fontsize=6)
+                        fit_text_to_box(
+                            page,
+                            _label_rect_above(rr),
+                            "EX_VALUE",
+                            {"max_font_size": 6, "min_font_size": 3},
+                        )
 
             doc.save(out_pdf)
             doc.close()
