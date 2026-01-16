@@ -467,6 +467,8 @@ class NACheckTab(ttk.Frame):
         self.btn_tick = ttk.Button(top, text="打勾（NA）", command=self.tick_na_placeholder)
         self.btn_tick.pack(side=tk.LEFT, padx=(0, 8))
 
+        ttk.Button(top, text="打开导出文件夹", command=self.open_filled_folder).pack(side=tk.LEFT, padx=(0, 8))
+
         ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
 
         ttk.Button(top, text="打开测试输出 test", command=lambda: open_folder(self._module_root() / "test")).pack(
@@ -759,6 +761,9 @@ class NACheckTab(ttk.Frame):
         path = OUTPUT_ROOT / MODULE_NAME
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    def open_filled_folder(self) -> None:
+        open_in_file_explorer(self._module_root() / "filled")
 
     def _report_root(self) -> Path:
         path = REPORT_ROOT / REPORT_MODULE_NAME

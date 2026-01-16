@@ -20,6 +20,7 @@ import threading
 import queue
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional, Set
+from pathlib import Path
 
 import fitz  # PyMuPDF
 import pandas as pd
@@ -33,7 +34,8 @@ from tkinter import ttk, filedialog, messagebox
 APP_NAME = "ITR 自动预填工具"
 APP_VERSION = "V1.0.3"
 
-from itr_modules.shared.paths import BASE_DIR, ensure_output_dir, ensure_report_dir, get_batch_id
+from itr_modules.shared.paths import BASE_DIR, ensure_output_dir, ensure_report_dir, get_batch_id, open_in_file_explorer
+from itr_modules.shared.pdf_utils import fit_text_to_box
 
 PRESETS_DIR = os.path.join(BASE_DIR, "presets")
 MODULE_NAME = "itr_autofill"
@@ -568,86 +570,6 @@ def find_cell_right_of_label(page: fitz.Page, line_segments, label_rect: fitz.Re
     return fitz.Rect(x0, y0, x1, y1)
 
 
-def tokenize_for_wrap(text: str) -> List[str]:
-    """尽量按“词”换行：优先空格分词，再按 / - 这种分隔符再细分。"""
-    text = str(text).strip()
-    if not text:
-        return []
-    parts = re.split(r"\s+", text)
-    tokens = []
-    for p in parts:
-        if not p:
-            continue
-        sub = re.split(r"([/-])", p)
-        buf = ""
-        for item in sub:
-            if item in ("/", "-"):
-                buf += item
-                tokens.append(buf)
-                buf = ""
-            else:
-                buf = item if buf == "" else buf + item
-        if buf:
-            tokens.append(buf)
-    return tokens
-
-
-def wrap_tokens(tokens: List[str], max_width: float, fontname: str, fontsize: float) -> List[str]:
-    lines = []
-    cur = ""
-    for t in tokens:
-        trial = t if cur == "" else cur + " " + t
-        w = fitz.get_text_length(trial, fontname=fontname, fontsize=fontsize)
-        if w <= max_width:
-            cur = trial
-        else:
-            if cur:
-                lines.append(cur)
-                cur = t
-            else:
-                lines.append(t)
-                cur = ""
-    if cur:
-        lines.append(cur)
-    return lines
-
-
-def put_text_autosize(page: fitz.Page, rect: fitz.Rect, text: str, text_cfg: dict):
-    """自动换行 + 字体自适应：不超格子，尽量接近 max_font_size。"""
-    if text is None:
-        return
-    text = str(text).strip()
-    if text == "":
-        return
-
-    max_font = float(text_cfg.get("max_font_size", 9))
-    min_font = float(text_cfg.get("min_font_size", 5))
-    padding = float(text_cfg.get("padding", 2))
-    line_gap = float(text_cfg.get("line_gap", 1.15))
-
-    inner = fitz.Rect(rect.x0 + padding, rect.y0 + 1, rect.x1 - padding, rect.y1 - 1)
-    max_w = inner.width
-    max_h = inner.height
-
-    fontname = "helv"
-    tokens = tokenize_for_wrap(text)
-
-    fs = max_font
-    while fs >= min_font:
-        lines = wrap_tokens(tokens, max_w, fontname, fs)
-        need_h = len(lines) * fs * line_gap
-        if need_h <= max_h:
-            y = inner.y0 + fs
-            for ln in lines:
-                page.insert_text((inner.x0, y), ln, fontsize=fs, fontname=fontname, color=(0, 0, 0))
-                y += fs * line_gap
-            return
-        fs -= 0.5
-
-    lines = wrap_tokens(tokens, max_w, fontname, min_font)
-    page.insert_textbox(inner, "\n".join(lines), fontsize=min_font, fontname=fontname, color=(0, 0, 0), align=0)
-
-
 # -------------------------
 # PDF 定位测试：画框
 # -------------------------
@@ -797,7 +719,7 @@ def write_one_itr(
                     continue
                 field_rect_cache[cache_key] = (label_rect, cell_rect)
 
-            put_text_autosize(page, cell_rect, str(value), text_cfg)
+            fit_text_to_box(page, cell_rect, str(value), text_cfg)
 
 
 def simple_input(parent, title: str, prompt: str, default: str = "") -> str:
@@ -902,6 +824,10 @@ class ITRAutofillTab(ttk.Frame):
             os.startfile(path)
         except Exception as e:
             messagebox.showerror("错误", f"无法打开输出文件夹: {e}")
+
+    def open_filled_folder(self):
+        path = Path(BASE_DIR) / "output" / MODULE_NAME / "filled"
+        open_in_file_explorer(path)
 
     # ------------------ UI ------------------
     def _build_ui(self):
@@ -1182,6 +1108,7 @@ class ITRAutofillTab(ttk.Frame):
         return res
 
     def preset_new(self):
+        """新建一个预设并载入到编辑区。"""
         base = "NewPreset"
         names = set(list_presets())
         i = 1
@@ -1295,6 +1222,16 @@ class ITRAutofillTab(ttk.Frame):
         self._set_preset_confirmed(True)
         messagebox.showinfo("完成", f"当前使用预设：{name}")
         self._update_main_preset_status()
+        if self._presets_window and self._presets_window.winfo_exists():
+            self._presets_window.withdraw()
+
+    def preset_apply(self):
+        """兼容可能存在的“应用”入口：等同于设为当前使用。"""
+        self.preset_set_active()
+
+    def preset_edit(self):
+        """预留的编辑入口，保证外部调用不报错。"""
+        messagebox.showinfo("提示", "当前已在右侧面板直接编辑预设字段。")
 
     def on_field_edit(self, event):
         iid = self.field_tree.identify_row(event.y)
@@ -1478,10 +1415,12 @@ class ITRAutofillTab(ttk.Frame):
 
         bottom = ttk.Frame(root)
         bottom.pack(fill="x", padx=10, pady=10)
-        self.btn_save_edits = ttk.Button(bottom, text="保存当前修改", command=self.save_current_edits)
-        self.btn_save_edits.pack(side="right")
+        self.btn_open_output = ttk.Button(bottom, text="打开导出文件夹", command=self.open_filled_folder)
+        self.btn_open_output.pack(side="right")
         self.btn_export = ttk.Button(bottom, text="导出填好的PDF + report.xlsx", command=self.export_all_async)
         self.btn_export.pack(side="right", padx=10)
+        self.btn_save_edits = ttk.Button(bottom, text="保存当前修改", command=self.save_current_edits)
+        self.btn_save_edits.pack(side="right")
         self.status = ttk.Label(bottom, text="就绪")
         self.status.pack(side="left")
 
