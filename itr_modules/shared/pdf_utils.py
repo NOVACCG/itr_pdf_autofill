@@ -1,0 +1,1 @@
+"""Shared PDF helpers (reserved for future shared logic)."""
