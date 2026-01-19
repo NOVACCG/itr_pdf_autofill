@@ -692,3 +692,12 @@ def detect_checkitems_table(
         "numbered_rows": numbered_rows,
         "state_bounds": state_bounds_map,
     }
+
+
+__all__ = [
+    "detect_checkitems_table",
+    "draw_checkmark",
+    "fit_text_to_box",
+    "norm_text",
+    "row_band_from_ys",
+]
