@@ -284,6 +284,46 @@ def get_cell_text(page: fitz.Page, cell: fitz.Rect) -> str:
     return (page.get_text("text", clip=cell) or "").strip()
 
 
+def get_cell_text_cached(
+    cell: fitz.Rect,
+    words: list[tuple] | None,
+    buckets: dict[int, list[tuple]] | None,
+    cache: dict[tuple[float, float, float, float], str] | None,
+    bucket_size: float = 8.0,
+) -> str:
+    if cache is None:
+        cache = {}
+    key = (round(cell.x0, 2), round(cell.y0, 2), round(cell.x1, 2), round(cell.y1, 2))
+    if key in cache:
+        return cache[key]
+
+    picked = []
+    if words:
+        if buckets:
+            if bucket_size <= 0:
+                bucket_size = 8.0
+            b0 = int(cell.y0 // bucket_size)
+            b1 = int(cell.y1 // bucket_size)
+            for b in range(b0, b1 + 1):
+                for w in buckets.get(b, []):
+                    wx0, wy0, wx1, wy1 = w[0], w[1], w[2], w[3]
+                    cx = (wx0 + wx1) / 2.0
+                    cy = (wy0 + wy1) / 2.0
+                    if cell.x0 <= cx <= cell.x1 and cell.y0 <= cy <= cell.y1:
+                        picked.append(w)
+        else:
+            for w in words:
+                wx0, wy0, wx1, wy1 = w[0], w[1], w[2], w[3]
+                cx = (wx0 + wx1) / 2.0
+                cy = (wy0 + wy1) / 2.0
+                if cell.x0 <= cx <= cell.x1 and cell.y0 <= cy <= cell.y1:
+                    picked.append(w)
+
+    text = _norm_join_words(picked).strip()
+    cache[key] = text
+    return text
+
+
 def extract_tag_by_cell_adjacency(
     page: fitz.Page,
     matchkey_norm: str,
@@ -854,6 +894,7 @@ __all__ = [
     "extract_tag_by_cell_adjacency",
     "extract_tag_candidates_first_page",
     "fit_text_to_box",
+    "get_cell_text_cached",
     "is_valid_tag_value",
     "norm_text",
     "row_band_from_ys",
