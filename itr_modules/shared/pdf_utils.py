@@ -597,6 +597,25 @@ def _find_header_cells(
     return cells
 
 
+def _scan_header_cells_by_grid(
+    page: fitz.Page,
+    xs: list[float],
+    band: tuple[float, float] | None,
+    header_norms: list[str],
+) -> dict[str, fitz.Rect]:
+    if not band or not xs or len(xs) < 2:
+        return {}
+    y0, y1 = band
+    header_norms_set = {norm_text(h) for h in header_norms if norm_text(h)}
+    cells: dict[str, fitz.Rect] = {}
+    for x0, x1 in zip(xs, xs[1:]):
+        rect = fitz.Rect(x0, y0, x1, y1)
+        txt = norm_text(get_cell_text(page, rect))
+        if txt and txt in header_norms_set:
+            cells[txt] = rect
+    return cells
+
+
 def _find_column_bounds(xs: list[float], header_rect: fitz.Rect | None) -> tuple[float, float] | None:
     if not header_rect:
         return None
@@ -646,8 +665,16 @@ def detect_checkitems_table(
         )
 
     index_header = header_cells.get(index_norm) or header_anchor
-    index_bounds = _find_column_bounds(xs, index_header)
     header_row_idx = _header_row_index(ys, index_header)
+    header_band_ys = row_band_from_ys(header_row_idx, ys) if header_row_idx >= 0 else None
+    if not header_cells and header_band_ys:
+        header_cells.update(_scan_header_cells_by_grid(page, xs, header_band_ys, header_norms))
+
+    index_header = header_cells.get(index_norm) or header_anchor
+    index_bounds = _find_column_bounds(xs, index_header)
+    if header_row_idx < 0 and index_header:
+        header_row_idx = _header_row_index(ys, index_header)
+        header_band_ys = row_band_from_ys(header_row_idx, ys) if header_row_idx >= 0 else None
 
     expected = 1
     numbered_rows: list[int] = []
@@ -666,6 +693,9 @@ def detect_checkitems_table(
                 break
 
     state_bounds_map: dict[str, tuple[float, float]] = {}
+    if header_band_ys and xs:
+        header_cells.update(_scan_header_cells_by_grid(page, xs, header_band_ys, header_norms))
+
     for state_norm in state_norms:
         state_header = header_cells.get(state_norm)
         bounds = _find_column_bounds(xs, state_header)

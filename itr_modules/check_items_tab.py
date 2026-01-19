@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import queue
+import re
 import threading
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -12,13 +13,27 @@ import tkinter as tk
 import fitz
 
 from itr_modules.shared.paths import OUTPUT_ROOT, ensure_output_dir, get_batch_id, open_in_file_explorer
-from itr_modules.shared.pdf_utils import detect_checkitems_table, norm_text, row_band_from_ys
+from itr_modules.shared.pdf_utils import (
+    detect_checkitems_table,
+    norm_text,
+    parse_pages_per_itr_regex,
+    row_band_from_ys,
+)
 
 MODULE_NAME = "check_items"
+DEFAULT_PAGE1_REGEX = r"Page\s*1\s*of\s*(\d+)"
+DEFAULT_TAG_REGEX = r"TAG\s*NO\.\s*:\s*([A-Za-z0-9\-\._/]+)"
 
 
 def _parse_norm_list(text: str) -> list[str]:
     return [norm_text(t) for t in (text or "").split(",") if norm_text(t)]
+
+
+def _safe_int(text: str) -> int | None:
+    try:
+        return int(text)
+    except Exception:
+        return None
 
 
 class CheckItemsTestTab(ttk.Frame):
@@ -28,11 +43,20 @@ class CheckItemsTestTab(ttk.Frame):
         self.header_norms_var = tk.StringVar(value="ITEM,DESCRIPTION,OK,NA,PL")
         self.index_col_norm_var = tk.StringVar(value="ITEM")
         self.state_col_norms_var = tk.StringVar(value="OK,NA,PL")
+        self.page1_regex_var = tk.StringVar(value=DEFAULT_PAGE1_REGEX)
+        self.pages_per_itr_var = tk.StringVar(value="")
+        self.matchkey_name_var = tk.StringVar(value="TAG")
+        self.tag_regex_var = tk.StringVar(value=DEFAULT_TAG_REGEX)
+
         self._worker_thread: threading.Thread | None = None
         self._q: "queue.Queue[tuple]" = queue.Queue()
         self._state_path = OUTPUT_ROOT / MODULE_NAME / ".state" / "session_state.json"
-        self.state: dict[str, dict] = {}
-        self.current_pdf: str | None = None
+
+        self.parsed_tags: dict[str, list[dict]] = {}
+        self.selections: dict[str, dict[int, dict[int, str]]] = {}
+        self.current_tag: str | None = None
+        self.current_itr_index: int | None = None
+
         self._build_ui()
         self._load_state()
 
@@ -41,6 +65,7 @@ class CheckItemsTestTab(ttk.Frame):
         top.pack(fill=tk.X)
 
         ttk.Button(top, text="批量导入 PDF", command=self.pick_pdfs).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(top, text="解析", command=self.parse_pdfs).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(top, text="Test（生成框图 PDF）", command=self.run_test).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(top, text="打开测试输出", command=self.open_test_folder).pack(side=tk.LEFT, padx=(0, 8))
 
@@ -65,6 +90,26 @@ class CheckItemsTestTab(ttk.Frame):
         ttk.Label(cfg, text="STATE_COL_NORMS：").grid(row=3, column=0, sticky="e", pady=(8, 0))
         ttk.Entry(cfg, textvariable=self.state_col_norms_var, width=50).grid(
             row=3, column=1, sticky="we", padx=6, pady=(8, 0)
+        )
+
+        ttk.Label(cfg, text="Page1 识别正则：").grid(row=4, column=0, sticky="e", pady=(8, 0))
+        ttk.Entry(cfg, textvariable=self.page1_regex_var, width=50).grid(
+            row=4, column=1, sticky="we", padx=6, pady=(8, 0)
+        )
+
+        ttk.Label(cfg, text="每个 ITR 页数（手动兜底）：").grid(row=5, column=0, sticky="e", pady=(8, 0))
+        ttk.Entry(cfg, textvariable=self.pages_per_itr_var, width=50).grid(
+            row=5, column=1, sticky="we", padx=6, pady=(8, 0)
+        )
+
+        ttk.Label(cfg, text="MatchKey 名称：").grid(row=6, column=0, sticky="e", pady=(8, 0))
+        ttk.Entry(cfg, textvariable=self.matchkey_name_var, width=50).grid(
+            row=6, column=1, sticky="we", padx=6, pady=(8, 0)
+        )
+
+        ttk.Label(cfg, text="Tag 正则：").grid(row=7, column=0, sticky="e", pady=(8, 0))
+        ttk.Entry(cfg, textvariable=self.tag_regex_var, width=50).grid(
+            row=7, column=1, sticky="we", padx=6, pady=(8, 0)
         )
 
         cfg.columnconfigure(1, weight=1)
@@ -101,7 +146,6 @@ class CheckItemsTestTab(ttk.Frame):
         bottom_paned.add(tag_frame, weight=1)
         bottom_paned.add(grid_frame, weight=3)
 
-        ttk.Label(tag_frame, text="Tag 列表：").pack(anchor="w")
         self.tag_list = tk.Listbox(tag_frame, height=8)
         self.tag_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         tag_sb = ttk.Scrollbar(tag_frame, orient="vertical", command=self.tag_list.yview)
@@ -109,7 +153,19 @@ class CheckItemsTestTab(ttk.Frame):
         self.tag_list.configure(yscrollcommand=tag_sb.set)
         self.tag_list.bind("<<ListboxSelect>>", self._on_tag_select)
 
-        self.mark_tree = ttk.Treeview(grid_frame, columns=("OK", "NA", "PL"), show="tree headings", height=10)
+        itr_frame = ttk.LabelFrame(grid_frame, text="ITR 列表", padding=(6, 4))
+        itr_frame.pack(fill=tk.X)
+        self.itr_list = tk.Listbox(itr_frame, height=4)
+        self.itr_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        itr_sb = ttk.Scrollbar(itr_frame, orient="vertical", command=self.itr_list.yview)
+        itr_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.itr_list.configure(yscrollcommand=itr_sb.set)
+        self.itr_list.bind("<<ListboxSelect>>", self._on_itr_select)
+
+        tree_frame = ttk.Frame(grid_frame)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+
+        self.mark_tree = ttk.Treeview(tree_frame, columns=("OK", "NA", "PL"), show="tree headings", height=10)
         self.mark_tree.heading("#0", text="Item")
         self.mark_tree.heading("OK", text="OK")
         self.mark_tree.heading("NA", text="NA")
@@ -119,10 +175,23 @@ class CheckItemsTestTab(ttk.Frame):
         self.mark_tree.column("NA", width=80, anchor="center")
         self.mark_tree.column("PL", width=80, anchor="center")
         self.mark_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        mark_sb = ttk.Scrollbar(grid_frame, orient="vertical", command=self.mark_tree.yview)
+        mark_sb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.mark_tree.yview)
         mark_sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.mark_tree.configure(yscrollcommand=mark_sb.set)
         self.mark_tree.bind("<Button-1>", self._on_mark_click)
+
+        self._set_parsed_ready(False)
+
+    def _set_parsed_ready(self, ready: bool) -> None:
+        state = tk.NORMAL if ready else tk.DISABLED
+        self.tag_list.configure(state=state)
+        self.itr_list.configure(state=state)
+        if not ready:
+            self.tag_list.delete(0, tk.END)
+            self.itr_list.delete(0, tk.END)
+            self.mark_tree.delete(*self.mark_tree.get_children())
+            self.current_tag = None
+            self.current_itr_index = None
 
     def _log(self, msg: str):
         self.log.insert(tk.END, msg + "\n")
@@ -158,53 +227,46 @@ class CheckItemsTestTab(ttk.Frame):
             payload = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return
-        if isinstance(payload, dict):
-            self.state = payload
+        if not isinstance(payload, dict):
+            return
+        selections = payload.get("selections", {})
+        if isinstance(selections, dict):
+            parsed = {}
+            for tag, itr_map in selections.items():
+                if not isinstance(itr_map, dict):
+                    continue
+                tag_map: dict[int, dict[int, str]] = {}
+                for itr_key, items in itr_map.items():
+                    try:
+                        itr_idx = int(itr_key)
+                    except Exception:
+                        continue
+                    if not isinstance(items, dict):
+                        continue
+                    item_map: dict[int, str] = {}
+                    for item_no, val in items.items():
+                        try:
+                            item_idx = int(item_no)
+                        except Exception:
+                            continue
+                        item_map[item_idx] = str(val)
+                    tag_map[itr_idx] = item_map
+                parsed[tag] = tag_map
+            self.selections = parsed
 
     def _save_state(self) -> None:
         path = self._state_file()
-        serializable = {}
-        for pdf_path, entry in self.state.items():
-            if not isinstance(entry, dict):
-                continue
-            marks = entry.get("marks", {})
-            serializable[pdf_path] = {
-                "item_count": int(entry.get("item_count", 0)),
-                "marks": {str(k): v for k, v in (marks or {}).items()},
+        payload = {
+            "selections": {
+                tag: {str(itr_idx): {str(k): v for k, v in items.items()} for itr_idx, items in itr_map.items()}
+                for tag, itr_map in self.selections.items()
             }
-        path.write_text(json.dumps(serializable, ensure_ascii=False, indent=2), encoding="utf-8")
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def _ensure_state_for_pdf(self, pdf_path: str) -> None:
-        entry = self.state.setdefault(pdf_path, {"item_count": 0, "marks": {}})
-        if entry.get("item_count", 0) > 0:
-            return
-
-        header_norms = _parse_norm_list(self.header_norms_var.get())
-        index_norm = norm_text(self.index_col_norm_var.get())
-        state_norms = _parse_norm_list(self.state_col_norms_var.get())
-        if not header_norms or not index_norm or not state_norms:
-            return
-
-        try:
-            doc = fitz.open(pdf_path)
-        except Exception as exc:
-            self._log(f"[检测失败] 无法打开 PDF：{Path(pdf_path).name} ({exc})")
-            return
-
-        for page in doc:
-            try:
-                info = detect_checkitems_table(page, header_norms, index_norm, state_norms)
-            except Exception as exc:
-                self._log(f"[检测失败] 解析表格异常：{Path(pdf_path).name} ({exc})")
-                continue
-            row_count = len(info.get("numbered_rows") or [])
-            if row_count:
-                entry["item_count"] = row_count
-                break
-        doc.close()
-        if entry.get("item_count", 0) == 0:
-            self._log(f"[检测失败] 未识别到有效序号行：{Path(pdf_path).name}")
-        self._save_state()
+    def _reset_parsed(self) -> None:
+        self.parsed_tags = {}
+        self._set_parsed_ready(False)
 
     def pick_pdfs(self):
         paths = filedialog.askopenfilenames(title="选择一个或多个 PDF", filetypes=[("PDF", "*.pdf")])
@@ -218,11 +280,10 @@ class CheckItemsTestTab(ttk.Frame):
                 new_list.append(p)
         self.pdf_paths = list(new_list)
         self.lst_pdfs.delete(0, tk.END)
-        self.tag_list.delete(0, tk.END)
+        self._reset_parsed()
         for p in self.pdf_paths:
             name = Path(p).name
             self.lst_pdfs.insert(tk.END, name)
-            self.tag_list.insert(tk.END, name)
         self._update_status()
         self._log(f"已导入 PDF：{len(self.pdf_paths)} 个")
 
@@ -234,26 +295,172 @@ class CheckItemsTestTab(ttk.Frame):
         path.mkdir(parents=True, exist_ok=True)
         return path
 
+    def _find_itr_segments(self, doc: fitz.Document, page1_regex: str, pages_per_itr: int | None) -> list[tuple[int, int]]:
+        starts = []
+        try:
+            page1_re = re.compile(page1_regex, re.IGNORECASE)
+        except re.error:
+            page1_re = re.compile(DEFAULT_PAGE1_REGEX, re.IGNORECASE)
+            self._log("[解析] Page1 正则非法，已回退默认规则。")
+
+        for i in range(doc.page_count):
+            text = doc[i].get_text("text") or ""
+            if page1_re.search(text):
+                starts.append(i)
+
+        if starts:
+            segments = []
+            for idx, start in enumerate(starts):
+                end = (starts[idx + 1] - 1) if idx + 1 < len(starts) else doc.page_count - 1
+                segments.append((start, end))
+            return segments
+
+        if pages_per_itr:
+            segments = []
+            for start in range(0, doc.page_count, pages_per_itr):
+                end = min(start + pages_per_itr - 1, doc.page_count - 1)
+                segments.append((start, end))
+            return segments
+
+        return []
+
+    def _extract_tag_from_segment(self, doc: fitz.Document, segment: tuple[int, int], tag_regex: str) -> str:
+        try:
+            rx = re.compile(tag_regex, re.IGNORECASE)
+        except re.error:
+            rx = re.compile(DEFAULT_TAG_REGEX, re.IGNORECASE)
+            self._log("[解析] Tag 正则非法，已回退默认规则。")
+
+        start, end = segment
+        for page_index in range(start, min(end + 1, start + 2)):
+            text = doc[page_index].get_text("text") or ""
+            m = rx.search(text)
+            if m:
+                return m.group(1).strip()
+        return ""
+
+    def _detect_item_count(self, doc: fitz.Document, segment: tuple[int, int]) -> int:
+        header_norms = _parse_norm_list(self.header_norms_var.get())
+        index_norm = norm_text(self.index_col_norm_var.get())
+        state_norms = _parse_norm_list(self.state_col_norms_var.get())
+        for page_index in range(segment[0], segment[1] + 1):
+            info = detect_checkitems_table(doc[page_index], header_norms, index_norm, state_norms)
+            count = len(info.get("numbered_rows") or [])
+            if count:
+                return count
+        return 0
+
+    def parse_pdfs(self) -> None:
+        if not self.pdf_paths:
+            messagebox.showwarning("提示", "请先批量导入 PDF")
+            return
+
+        page1_regex = self.page1_regex_var.get().strip() or DEFAULT_PAGE1_REGEX
+        pages_per_itr_manual = _safe_int(self.pages_per_itr_var.get().strip())
+        tag_regex = self.tag_regex_var.get().strip() or DEFAULT_TAG_REGEX
+        matchkey_name = self.matchkey_name_var.get().strip() or "TAG"
+
+        self.parsed_tags = {}
+        unknown_idx = 1
+
+        for pdf_path in self.pdf_paths:
+            try:
+                doc = fitz.open(pdf_path)
+            except Exception as exc:
+                self._log(f"[解析失败] 无法打开 PDF：{Path(pdf_path).name} ({exc})")
+                continue
+
+            pages_per_itr_auto = parse_pages_per_itr_regex(doc, page1_regex, scan_pages=min(4, doc.page_count))
+            if pages_per_itr_auto:
+                self._log(f"[解析] {Path(pdf_path).name} 自动识别每套页数：{pages_per_itr_auto}")
+            else:
+                if pages_per_itr_manual:
+                    self._log(f"[解析] {Path(pdf_path).name} 自动识别失败，使用手动页数：{pages_per_itr_manual}")
+                else:
+                    self._log(f"[解析失败] {Path(pdf_path).name} 无法识别每套页数，请填写手动页数。")
+
+            segments = self._find_itr_segments(
+                doc,
+                page1_regex,
+                pages_per_itr_auto or pages_per_itr_manual,
+            )
+            if not segments:
+                self._log(f"[解析失败] {Path(pdf_path).name} 未能拆分 ITR 页段。")
+                doc.close()
+                continue
+
+            for itr_idx, segment in enumerate(segments, start=1):
+                tag_id = self._extract_tag_from_segment(doc, segment, tag_regex)
+                if not tag_id:
+                    tag_id = f"UNKNOWN-{unknown_idx}"
+                    unknown_idx += 1
+                    self._log(
+                        f"[解析] {Path(pdf_path).name} 第{itr_idx}套未找到{matchkey_name}，使用 {tag_id}"
+                    )
+
+                item_count = self._detect_item_count(doc, segment)
+                if item_count == 0:
+                    self._log(f"[解析] {Path(pdf_path).name} 第{itr_idx}套未识别到序号行。")
+
+                entry = {
+                    "pdf_path": pdf_path,
+                    "itr_index": itr_idx,
+                    "segment": segment,
+                    "item_count": item_count,
+                }
+                self.parsed_tags.setdefault(tag_id, []).append(entry)
+
+            doc.close()
+
+        if not self.parsed_tags:
+            self._set_parsed_ready(False)
+            messagebox.showwarning("提示", "未解析到任何 Tag，请检查配置或日志。")
+            return
+
+        self.tag_list.delete(0, tk.END)
+        for tag in sorted(self.parsed_tags.keys()):
+            self.tag_list.insert(tk.END, tag)
+        self._set_parsed_ready(True)
+        self._log("[解析完成] Tag 列表已生成。")
+
     def _on_tag_select(self, _event=None) -> None:
-        sel = self.tag_list.curselection()
-        if not sel:
+        if not self.tag_list.curselection():
             return
-        idx = sel[0]
-        if idx >= len(self.pdf_paths):
+        idx = self.tag_list.curselection()[0]
+        tag = self.tag_list.get(idx)
+        if not tag:
             return
-        self.current_pdf = self.pdf_paths[idx]
-        self._ensure_state_for_pdf(self.current_pdf)
+        self.current_tag = tag
+        self.current_itr_index = None
+        self.itr_list.delete(0, tk.END)
+        self.mark_tree.delete(*self.mark_tree.get_children())
+
+        itr_entries = self.parsed_tags.get(tag, [])
+        for itr_idx, entry in enumerate(itr_entries, start=1):
+            start, end = entry["segment"]
+            name = f"ITR-{itr_idx} (p{start + 1}-{end + 1})"
+            self.itr_list.insert(tk.END, name)
+
+    def _on_itr_select(self, _event=None) -> None:
+        if self.current_tag is None:
+            return
+        if not self.itr_list.curselection():
+            return
+        itr_idx = self.itr_list.curselection()[0] + 1
+        self.current_itr_index = itr_idx
         self._render_marks()
 
     def _render_marks(self) -> None:
         self.mark_tree.delete(*self.mark_tree.get_children())
-        if not self.current_pdf:
+        if self.current_tag is None or self.current_itr_index is None:
             return
-        entry = self.state.get(self.current_pdf, {})
-        item_count = int(entry.get("item_count", 0))
-        marks = entry.get("marks", {}) or {}
+        itr_entries = self.parsed_tags.get(self.current_tag, [])
+        if self.current_itr_index - 1 >= len(itr_entries):
+            return
+        item_count = int(itr_entries[self.current_itr_index - 1].get("item_count", 0))
+        marks = self.selections.get(self.current_tag, {}).get(self.current_itr_index, {})
         for i in range(1, item_count + 1):
-            mark = marks.get(str(i), "")
+            mark = marks.get(i, "")
             values = (
                 "✓" if mark == "OK" else "",
                 "✓" if mark == "NA" else "",
@@ -262,7 +469,7 @@ class CheckItemsTestTab(ttk.Frame):
             self.mark_tree.insert("", tk.END, iid=str(i), text=str(i), values=values)
 
     def _on_mark_click(self, event) -> None:
-        if not self.current_pdf:
+        if self.current_tag is None or self.current_itr_index is None:
             return
         row_id = self.mark_tree.identify_row(event.y)
         col_id = self.mark_tree.identify_column(event.x)
@@ -273,13 +480,17 @@ class CheckItemsTestTab(ttk.Frame):
         if not col:
             return
 
-        entry = self.state.setdefault(self.current_pdf, {"item_count": 0, "marks": {}})
-        marks = entry.setdefault("marks", {})
-        current = marks.get(str(row_id), "")
+        tag_map = self.selections.setdefault(self.current_tag, {})
+        marks = tag_map.setdefault(self.current_itr_index, {})
+        try:
+            row_num = int(row_id)
+        except Exception:
+            return
+        current = marks.get(row_num, "")
         if current == col:
-            marks[str(row_id)] = ""
+            marks[row_num] = ""
         else:
-            marks[str(row_id)] = col
+            marks[row_num] = col
         self._save_state()
         self._render_marks()
 
@@ -302,6 +513,7 @@ class CheckItemsTestTab(ttk.Frame):
 
         batch_id = get_batch_id()
         out_dir = ensure_output_dir(MODULE_NAME, "test", batch_id)
+        ensure_output_dir(MODULE_NAME, "filled", batch_id)
 
         self._worker_thread = threading.Thread(
             target=self._test_worker,
@@ -340,7 +552,6 @@ class CheckItemsTestTab(ttk.Frame):
             stem = Path(pdf_path).stem
             out_pdf = out_dir / f"{stem}_test.pdf"
             doc = fitz.open(pdf_path)
-            detected_rows = 0
 
             for page in doc:
                 info = detect_checkitems_table(page, header_norms, index_norm, state_norms)
@@ -352,8 +563,6 @@ class CheckItemsTestTab(ttk.Frame):
 
                 if not (index_bounds and ys and numbered_rows):
                     continue
-
-                detected_rows = max(detected_rows, len(numbered_rows))
 
                 for rect in header_cells.values():
                     page.draw_rect(rect, color=(0, 0, 1), width=1.2)
@@ -382,10 +591,6 @@ class CheckItemsTestTab(ttk.Frame):
 
             doc.save(out_pdf)
             doc.close()
-            if detected_rows:
-                entry = self.state.setdefault(pdf_path, {"item_count": 0, "marks": {}})
-                entry["item_count"] = max(int(entry.get("item_count", 0)), detected_rows)
-                self._save_state()
             self._q.put(("log", f"[Test] 已生成：{out_pdf}"))
 
         self._q.put(("done", out_dir))
