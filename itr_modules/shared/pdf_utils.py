@@ -233,58 +233,6 @@ def get_cell_text(page: fitz.Page, cell: fitz.Rect) -> str:
     return (page.get_text("text", clip=cell) or "").strip()
 
 
-def _build_word_buckets(words: list[tuple], bucket_size: float = 8.0) -> dict[int, list[tuple]]:
-    buckets: dict[int, list[tuple]] = {}
-    if bucket_size <= 0:
-        bucket_size = 8.0
-    for w in words:
-        y0 = w[1]
-        y1 = w[3]
-        b0 = int(y0 // bucket_size)
-        b1 = int(y1 // bucket_size)
-        for b in range(b0, b1 + 1):
-            buckets.setdefault(b, []).append(w)
-    return buckets
-
-
-def _cell_text_from_words(
-    cell: fitz.Rect,
-    words: list[tuple],
-    buckets: dict[int, list[tuple]],
-    bucket_size: float = 8.0,
-) -> str:
-    if not words:
-        return ""
-    if bucket_size <= 0:
-        bucket_size = 8.0
-    b0 = int(cell.y0 // bucket_size)
-    b1 = int(cell.y1 // bucket_size)
-    picked = []
-    for b in range(b0, b1 + 1):
-        for w in buckets.get(b, []):
-            wx0, wy0, wx1, wy1 = w[0], w[1], w[2], w[3]
-            cx = (wx0 + wx1) / 2.0
-            cy = (wy0 + wy1) / 2.0
-            if cell.x0 <= cx <= cell.x1 and cell.y0 <= cy <= cell.y1:
-                picked.append(w)
-    return _norm_join_words(picked)
-
-
-def get_cell_text_cached(
-    cell: fitz.Rect,
-    words: list[tuple],
-    buckets: dict[int, list[tuple]],
-    cache: dict[tuple[float, float, float, float], str],
-    bucket_size: float = 8.0,
-) -> str:
-    key = (round(cell.x0, 2), round(cell.y0, 2), round(cell.x1, 2), round(cell.y1, 2))
-    if key in cache:
-        return cache[key]
-    text = _cell_text_from_words(cell, words, buckets, bucket_size=bucket_size).strip()
-    cache[key] = text
-    return text
-
-
 def _norm_join_words(words_in_row) -> str:
     """Join words in a row (PyMuPDF words tuples) from left to right."""
     if not words_in_row:
@@ -381,21 +329,16 @@ def find_cell_by_exact_norm(
     verticals,
     horizontals,
     search_clip: fitz.Rect | None = None,
-    words: list[tuple] | None = None,
-    buckets: dict[int, list[tuple]] | None = None,
-    cache: dict[tuple[float, float, float, float], str] | None = None,
 ) -> fitz.Rect | None:
     target_norm = norm_text(target)
-    words = words if words is not None else (page.get_text("words", clip=search_clip) if search_clip else page.get_text("words"))
-    buckets = buckets if buckets is not None else _build_word_buckets(words)
-    cache = cache if cache is not None else {}
+    words = page.get_text("words", clip=search_clip) if search_clip else page.get_text("words")
 
     candidates = []
     for x0, y0, x1, y1, w, *_ in words:
         wn = norm_text(w)
         if not wn:
             continue
-        if wn == target_norm:
+        if wn in target_norm or target_norm in wn:
             cell = cell_rect_for_word(fitz.Rect(x0, y0, x1, y1), verticals, horizontals)
             if cell:
                 candidates.append(cell)
@@ -414,7 +357,7 @@ def find_cell_by_exact_norm(
             uniq.append(c)
 
     for cell in uniq:
-        if norm_text(get_cell_text_cached(cell, words, buckets, cache)) == target_norm:
+        if norm_text(get_cell_text(page, cell)) == target_norm:
             return cell
     return None
 
@@ -659,9 +602,6 @@ def _scan_header_cells_by_grid(
     xs: list[float],
     band: tuple[float, float] | None,
     header_norms: list[str],
-    words: list[tuple],
-    buckets: dict[int, list[tuple]],
-    cache: dict[tuple[float, float, float, float], str],
 ) -> dict[str, fitz.Rect]:
     if not band or not xs or len(xs) < 2:
         return {}
@@ -670,7 +610,7 @@ def _scan_header_cells_by_grid(
     cells: dict[str, fitz.Rect] = {}
     for x0, x1 in zip(xs, xs[1:]):
         rect = fitz.Rect(x0, y0, x1, y1)
-        txt = norm_text(get_cell_text_cached(rect, words, buckets, cache))
+        txt = norm_text(get_cell_text(page, rect))
         if txt and txt in header_norms_set:
             cells[txt] = rect
     return cells
@@ -681,7 +621,6 @@ def _detect_header_row_index(
     ys: list[float],
     header_norms: list[str],
     header_anchor: fitz.Rect | None,
-    words: list[tuple],
 ) -> int:
     if header_anchor:
         idx = _header_row_index(ys, header_anchor)
@@ -690,6 +629,7 @@ def _detect_header_row_index(
     if not ys:
         return -1
     header_set = {norm_text(h) for h in header_norms if norm_text(h)}
+    words = page.get_text("words") or []
     counts: dict[int, int] = {}
     for x0, y0, x1, y1, w, *_ in words:
         if norm_text(w) in header_set:
@@ -725,8 +665,6 @@ def detect_checkitems_table(
     """Detect CheckItems table structure for a single page."""
     verticals, horizontals = extract_rulings(page)
     words = page.get_text("words") or []
-    buckets = _build_word_buckets(words)
-    cell_cache: dict[tuple[float, float, float, float], str] = {}
 
     header_anchor = find_lowest_header_anchor(page, header_norms, verticals, horizontals)
     header_band = header_row_band(header_anchor) if header_anchor else None
@@ -743,20 +681,7 @@ def detect_checkitems_table(
     xs, ys = extract_table_grid_lines(page, table_rect, verticals, horizontals)
 
     search_clip = header_band if header_band else table_rect
-    header_cells = {}
-    for norm in header_norms:
-        rect = find_cell_by_exact_norm(
-            page,
-            norm,
-            verticals,
-            horizontals,
-            search_clip=search_clip,
-            words=words,
-            buckets=buckets,
-            cache=cell_cache,
-        )
-        if rect:
-            header_cells[norm] = rect
+    header_cells = _find_header_cells(page, header_norms, verticals, horizontals, search_clip)
     if header_band is None and header_cells:
         header_band = fitz.Rect(
             table_rect.x0,
@@ -765,10 +690,10 @@ def detect_checkitems_table(
             max(r.y1 for r in header_cells.values()) + 2,
         )
 
-    header_row_idx = _detect_header_row_index(page, ys, header_norms, header_anchor, words)
+    header_row_idx = _detect_header_row_index(page, ys, header_norms, header_anchor)
     header_band_ys = row_band_from_ys(header_row_idx, ys) if header_row_idx >= 0 else None
     if not header_cells and header_band_ys:
-        header_cells.update(_scan_header_cells_by_grid(page, xs, header_band_ys, header_norms, words, buckets, cell_cache))
+        header_cells.update(_scan_header_cells_by_grid(page, xs, header_band_ys, header_norms))
 
     index_header = header_cells.get(index_norm)
     index_bounds = _find_column_bounds(xs, index_header)
@@ -784,7 +709,7 @@ def detect_checkitems_table(
                 continue
             y0, y1 = band
             cell = fitz.Rect(index_bounds[0], y0, index_bounds[1], y1)
-            cell_text = get_cell_text_cached(cell, words, buckets, cell_cache)
+            cell_text = get_cell_text(page, cell)
             if is_pure_int(cell_text) and int(cell_text) == expected:
                 numbered_rows.append(i)
                 expected += 1
@@ -793,7 +718,7 @@ def detect_checkitems_table(
 
     state_bounds_map: dict[str, tuple[float, float]] = {}
     if header_band_ys and xs:
-        header_cells.update(_scan_header_cells_by_grid(page, xs, header_band_ys, header_norms, words, buckets, cell_cache))
+        header_cells.update(_scan_header_cells_by_grid(page, xs, header_band_ys, header_norms))
 
     for state_norm in state_norms:
         state_header = header_cells.get(state_norm)
@@ -814,7 +739,7 @@ def detect_checkitems_table(
 
     header_texts = {}
     for norm, rect in header_cells.items():
-        header_texts[norm] = get_cell_text_cached(rect, words, buckets, cell_cache)
+        header_texts[norm] = get_cell_text(page, rect)
 
     return {
         "table_bbox": table_rect,

@@ -17,7 +17,7 @@ from itr_modules.shared.pdf_utils import (
     detect_checkitems_table,
     extract_rulings,
     find_cell_by_exact_norm,
-    get_cell_text_cached,
+    get_cell_text,
     norm_text,
     parse_pages_per_itr_regex,
     row_band_from_ys,
@@ -47,20 +47,6 @@ def _unique_sorted(vals: list[float], tol: float = 0.6) -> list[float]:
         if not out or abs(v - out[-1]) > tol:
             out.append(v)
     return out
-
-
-def _build_word_buckets(words: list[tuple], bucket_size: float = 8.0) -> dict[int, list[tuple]]:
-    buckets: dict[int, list[tuple]] = {}
-    if bucket_size <= 0:
-        bucket_size = 8.0
-    for w in words:
-        y0 = w[1]
-        y1 = w[3]
-        b0 = int(y0 // bucket_size)
-        b1 = int(y1 // bucket_size)
-        for b in range(b0, b1 + 1):
-            buckets.setdefault(b, []).append(w)
-    return buckets
 
 
 def _row_index_from_ys(ys: list[float], y_center: float) -> int:
@@ -363,9 +349,6 @@ class CheckItemsTestTab(ttk.Frame):
         tag_regex: str,
         direction: str,
     ) -> tuple[fitz.Rect | None, fitz.Rect | None, str]:
-        words = page.get_text("words") or []
-        buckets = _build_word_buckets(words)
-        cache: dict[tuple[float, float, float, float], str] = {}
         verticals, horizontals = extract_rulings(page)
         xs = _unique_sorted([x for x, _, _ in verticals])
         ys = _unique_sorted([y for y, _, _ in horizontals])
@@ -376,9 +359,6 @@ class CheckItemsTestTab(ttk.Frame):
             verticals,
             horizontals,
             search_clip=None,
-            words=words,
-            buckets=buckets,
-            cache=cache,
         )
         if not match_cell:
             return None, None, ""
@@ -399,7 +379,7 @@ class CheckItemsTestTab(ttk.Frame):
 
         tag_value = ""
         if value_cell:
-            raw = get_cell_text_cached(value_cell, words, buckets, cache)
+            raw = get_cell_text(page, value_cell)
             try:
                 rx = re.compile(tag_regex, re.IGNORECASE)
             except re.error:
