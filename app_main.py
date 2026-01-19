@@ -6,7 +6,7 @@ import tkinter as tk
 from tkinter import ttk
 from tkinter.scrolledtext import ScrolledText
 
-from itr_modules import ITRAutofillTab
+from itr_modules import CheckItemsTestTab, ITRAutofillTab
 from itr_modules.itr_autofill_tab import APP_NAME, APP_VERSION
 
 from itr_modules.shared.paths import OUTPUT_ROOT, REPORT_ROOT, open_in_file_explorer
@@ -269,6 +269,7 @@ def main() -> None:
 
     manager = TabManager(tab_header, notebook)
     manager.register_tab("itr_autofill", "表头预填（ITR Autofill）", ITRAutofillTab)
+    manager.register_tab("check_items_test", "非防爆 CheckItems（测试）", CheckItemsTestTab)
 
     home = ttk.Frame(notebook)
     manager.register_home("home", "主页", home)
@@ -294,6 +295,12 @@ def main() -> None:
         command=lambda: manager.open_tab("itr_autofill"),
         width=28,
     ).pack(side="left", padx=(0, 12))
+    ttk.Button(
+        btns,
+        text="非防爆 CheckItems（测试）",
+        command=lambda: manager.open_tab("check_items_test"),
+        width=30,
+    ).pack(side="left")
 
     bottom = ttk.Frame(home)
     bottom.grid(row=3, column=0, sticky="sew", padx=24, pady=20)
