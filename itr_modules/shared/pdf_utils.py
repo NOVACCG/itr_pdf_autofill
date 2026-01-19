@@ -286,6 +286,84 @@ def get_cell_text(page: fitz.Page, cell: fitz.Rect) -> str:
     return (page.get_text("text", clip=cell) or "").strip()
 
 
+def _cell_rect_from_point(
+    mid_x: float,
+    mid_y: float,
+    verticals: list[tuple[float, float, float]],
+    horizontals: list[tuple[float, float, float]],
+    tol: float = 1.5,
+) -> fitz.Rect | None:
+    xs = [round(x, 1) for x, y0, y1 in verticals if y0 - tol <= mid_y <= y1 + tol]
+    ys = [round(y, 1) for y, x0, x1 in horizontals if x0 - tol <= mid_x <= x1 + tol]
+    if not xs or not ys:
+        return None
+    lefts = [x for x in xs if x <= mid_x + 0.1]
+    rights = [x for x in xs if x >= mid_x - 0.1]
+    tops = [y for y in ys if y <= mid_y + 0.1]
+    bottoms = [y for y in ys if y >= mid_y - 0.1]
+    if not lefts or not rights or not tops or not bottoms:
+        return None
+    x0 = max(lefts)
+    x1 = min(rights)
+    y0 = max(tops)
+    y1 = min(bottoms)
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return fitz.Rect(x0 + 0.2, y0 + 0.2, x1 - 0.2, y1 - 0.2)
+
+
+def _anchor_candidates(words: list[tuple], anchor_norms: list[str]) -> list[tuple[fitz.Rect, str]]:
+    candidates: list[tuple[fitz.Rect, str]] = []
+    if not words:
+        return candidates
+    by_line: dict[int, list[tuple]] = {}
+    for w in words:
+        by_line.setdefault(w[6], []).append(w)
+    anchor_set = {norm_text(a) for a in anchor_norms if norm_text(a)}
+    for line_words in by_line.values():
+        line_words.sort(key=lambda w: (w[0], w[1]))
+        norms = [norm_text(w[4]) for w in line_words]
+        for i in range(len(line_words)):
+            combined = ""
+            for j in range(i, min(i + 4, len(line_words))):
+                combined += norms[j]
+                if combined in anchor_set:
+                    x0 = min(line_words[k][0] for k in range(i, j + 1))
+                    y0 = min(line_words[k][1] for k in range(i, j + 1))
+                    x1 = max(line_words[k][2] for k in range(i, j + 1))
+                    y1 = max(line_words[k][3] for k in range(i, j + 1))
+                    candidates.append((fitz.Rect(x0, y0, x1, y1), combined))
+    return candidates
+
+
+def find_anchor_cell_strict(
+    page: fitz.Page,
+    anchor_norms: list[str],
+    tol: float = 1.5,
+) -> tuple[fitz.Rect | None, dict]:
+    verticals, horizontals = extract_rulings(page, tol=tol)
+    words = page.get_text("words") or []
+    candidates = _anchor_candidates(words, anchor_norms)
+    debug = {"anchor_norms": anchor_norms}
+    for bbox, _ in candidates:
+        mid_x = (bbox.x0 + bbox.x1) / 2.0
+        mid_y = (bbox.y0 + bbox.y1) / 2.0
+        cell = _cell_rect_from_point(mid_x, mid_y, verticals, horizontals, tol=tol)
+        if not cell:
+            continue
+        raw = get_cell_text(page, cell)
+        cell_norm = norm_text(raw)
+        if cell_norm in {norm_text(a) for a in anchor_norms}:
+            debug.update({
+                "key_cell_rect": cell,
+                "key_cell_text_raw": raw,
+                "key_cell_text_norm": cell_norm,
+            })
+            return cell, debug
+    debug["error"] = "anchor_cell_not_found"
+    return None, debug
+
+
 def get_cell_text_cached(
     cell: fitz.Rect,
     words: list[tuple] | None,
@@ -331,172 +409,47 @@ def extract_tag_by_cell_adjacency(
     matchkey_norm: str,
     direction: str,
 ) -> tuple[str | None, dict]:
-    verticals, horizontals = extract_rulings(page)
-    match_cell = find_cell_by_exact_norm(page, matchkey_norm, verticals, horizontals)
-    debug = {"match_cell": match_cell, "direction": direction}
-    if not match_cell:
+    key_cell, key_debug = find_anchor_cell_strict(page, [matchkey_norm])
+    debug = {"direction": direction}
+    debug.update(key_debug)
+    if not key_cell:
         debug["error"] = "match_cell_not_found"
         return None, debug
 
-    label_text = get_cell_text(page, match_cell)
-    debug["cell_norm"] = norm_text(label_text)
-
-    key_words = []
-    for x0, y0, x1, y1, w, *_ in page.get_text("words", clip=match_cell) or []:
-        wn = norm_text(w)
-        if not wn:
-            continue
-        if wn in matchkey_norm or matchkey_norm in wn:
-            key_words.append((x0, y0, x1, y1))
-    if not key_words:
-        candidates = []
-        for x0, y0, x1, y1, w, *_ in page.get_text("words") or []:
-            wn = norm_text(w)
-            if wn and (wn == matchkey_norm or wn in matchkey_norm or matchkey_norm in wn):
-                candidates.append((x0, y0, x1, y1))
-        if candidates:
-            candidates.sort(key=lambda r: abs(r[1] - match_cell.y0))
-            key_words = candidates
-    if key_words:
-        key_bbox = fitz.Rect(
-            min(r[0] for r in key_words),
-            min(r[1] for r in key_words),
-            max(r[2] for r in key_words),
-            max(r[3] for r in key_words),
-        )
-    else:
-        key_bbox = match_cell
-    debug["key_bbox"] = key_bbox
-
-    eps = 0.5
-    row_pad = max(6.0, match_cell.height * 0.6)
-    row_y0 = match_cell.y0 - row_pad
-    row_y1 = match_cell.y1 + row_pad
-    row_band = fitz.Rect(page.rect.x0, row_y0, page.rect.x1, row_y1)
-    debug.update({"row_pad": row_pad, "row_y0": row_y0, "row_y1": row_y1})
-
-    xs_row = _uniq_sorted([
-        x for x, y0, y1 in verticals
-        if y1 >= row_y0 - 1 and y0 <= row_y1 + 1
-    ])
-    ys_col = _uniq_sorted([
-        y for y, x0, x1 in horizontals
-        if x1 >= match_cell.x0 - 1 and x0 <= match_cell.x1 + 1
-    ])
-    debug["xs_row_len"] = len(xs_row)
-    debug["xs_row_head"] = xs_row[:6]
-    debug["ys_col_len"] = len(ys_col)
-    debug["ys_col_head"] = ys_col[:6]
-
-    divider_x = next((x for x in xs_row if x > key_bbox.x1 + 0.5), None)
-    if divider_x is None:
-        divider_x = key_bbox.x1 + 2.0
-    divider_left_x = next((x for x in reversed(xs_row) if x < key_bbox.x0 - 0.5), None)
-    if divider_left_x is None:
-        divider_left_x = key_bbox.x0 - 2.0
-    debug["divider_x"] = divider_x
-    debug["divider_left_x"] = divider_left_x
+    verticals, horizontals = extract_rulings(page)
+    key_left, key_top, key_right, key_bottom = key_cell.x0, key_cell.y0, key_cell.x1, key_cell.y1
+    row_mid = (key_top + key_bottom) / 2.0
+    col_mid = (key_left + key_right) / 2.0
+    xs = [round(x, 1) for x, y0, y1 in verticals if y0 - 1 <= row_mid <= y1 + 1]
+    ys = [round(y, 1) for y, x0, x1 in horizontals if x0 - 1 <= col_mid <= x1 + 1]
 
     direction = (direction or "RIGHT").upper()
-    value_cell = None
     margin = 36
-    eps2 = 1.0
+    value_cell = None
     if direction == "RIGHT":
-        x0 = divider_x
-        x1 = next((x for x in xs_row if x > x0 + 1.0), None)
-        if x1 is None:
-            x1 = page.rect.x1 - margin
-        value_cell = fitz.Rect(x0, row_y0, x1, row_y1)
+        right_x = min([x for x in xs if x > key_right + 0.5], default=page.rect.x1 - margin)
+        value_cell = fitz.Rect(key_right, key_top, right_x, key_bottom)
     elif direction == "LEFT":
-        x1 = next((x for x in reversed(xs_row) if x <= match_cell.x0 + eps2), None)
-        if x1 is None:
-            x1 = match_cell.x0 - 1.0
-        x0 = next((x for x in reversed(xs_row) if x < x1 - 1.0), None)
-        if x0 is None:
-            x0 = page.rect.x0 + margin
-        value_cell = fitz.Rect(x0, row_y0, x1, row_y1)
+        left_x = max([x for x in xs if x < key_left - 0.5], default=page.rect.x0 + margin)
+        value_cell = fitz.Rect(left_x, key_top, key_left, key_bottom)
     elif direction == "DOWN":
-        y0_down = next((y for y in ys_col if y > match_cell.y1 + eps), None)
-        if y0_down is None:
-            y0_down = match_cell.y1 + 1.0
-        y1_down = next((y for y in ys_col if y > y0_down + eps), None)
-        if y1_down is None:
-            y1_down = row_y1
-        value_cell = fitz.Rect(match_cell.x0, y0_down, match_cell.x1, y1_down)
+        down_y = min([y for y in ys if y > key_bottom + 0.5], default=page.rect.y1 - margin)
+        value_cell = fitz.Rect(key_left, key_bottom, key_right, down_y)
     else:
-        y1_up = next((y for y in reversed(ys_col) if y < match_cell.y0 - eps), None)
-        if y1_up is None:
-            y1_up = match_cell.y0 - 1.0
-        y0_up = next((y for y in reversed(ys_col) if y < y1_up - eps), None)
-        if y0_up is None:
-            y0_up = row_y0
-        value_cell = fitz.Rect(match_cell.x0, y0_up, match_cell.x1, y1_up)
+        up_y = max([y for y in ys if y < key_top - 0.5], default=page.rect.y0 + margin)
+        value_cell = fitz.Rect(key_left, up_y, key_right, key_top)
 
-    debug["value_cell_before_fallback"] = value_cell
+    debug["key_cell_rect"] = key_cell
+    debug["value_cell_rect"] = value_cell
+    if value_cell.width <= 10 or value_cell.height <= 5:
+        debug["error"] = "adjacent_cell_not_found"
+        return None, debug
 
     raw = get_cell_text(page, value_cell)
-    debug["raw_preview"] = (raw or "")[:80]
-    fallback_words_used = False
-    fallback_words_count = 0
-    picked_words_sample = []
-    if not normalize_cell_text(raw):
-        words = page.get_text("words", clip=row_band) or []
-        picked = []
-        if direction == "RIGHT":
-            for x0, y0, x1, y1, w, *_ in words:
-                if x0 < divider_x - 0.5:
-                    continue
-                overlap = max(0.0, min(y1, row_y1) - max(y0, row_y0))
-                height = max(y1 - y0, 1.0)
-                if overlap / height >= 0.4:
-                    picked.append((x0, y0, x1, y1))
-        elif direction == "LEFT":
-            for x0, y0, x1, y1, w, *_ in words:
-                if x1 > divider_left_x + 0.5:
-                    continue
-                overlap = max(0.0, min(y1, row_y1) - max(y0, row_y0))
-                height = max(y1 - y0, 1.0)
-                if overlap / height >= 0.4:
-                    picked.append((x0, y0, x1, y1))
-        elif direction == "DOWN":
-            for x0, y0, x1, y1, w, *_ in words:
-                if y0 < match_cell.y1 - 1.0:
-                    continue
-                overlap = max(0.0, min(x1, match_cell.x1) - max(x0, match_cell.x0))
-                width = max(x1 - x0, 1.0)
-                if overlap / width >= 0.4:
-                    picked.append((x0, y0, x1, y1))
-        else:
-            for x0, y0, x1, y1, w, *_ in words:
-                if y1 > match_cell.y0 + 1.0:
-                    continue
-                overlap = max(0.0, min(x1, match_cell.x1) - max(x0, match_cell.x0))
-                width = max(x1 - x0, 1.0)
-                if overlap / width >= 0.4:
-                    picked.append((x0, y0, x1, y1))
-        picked_words_sample = picked[:5]
-        fallback_words_count = len(picked)
-        if picked:
-            x0_min = min(r[0] for r in picked) - 2
-            y0_min = min(r[1] for r in picked) - 2
-            x1_max = max(r[2] for r in picked) + 2
-            y1_max = max(r[3] for r in picked) + 2
-            value_cell = fitz.Rect(x0_min, y0_min, x1_max, y1_max)
-            raw = get_cell_text(page, value_cell)
-            fallback_words_used = True
-            debug["raw_preview"] = (raw or "")[:80]
-
-    debug.update({
-        "fallback_words_used": fallback_words_used,
-        "fallback_words_count": fallback_words_count,
-        "picked_words_sample": picked_words_sample,
-        "value_cell_after_fallback": value_cell if fallback_words_used else None,
-        "value_cell": value_cell,
-        "raw": raw,
-    })
-
+    debug["value_cell_text_raw"] = raw
+    debug["value_cell_text_raw_preview"] = (raw or "")[:200]
     normed = normalize_cell_text(raw)
-    debug["norm"] = normed
+    debug["value_cell_text_normed"] = normed
     if not normed:
         debug["error"] = "adjacent_cell_empty"
         return None, debug
@@ -551,170 +504,46 @@ def extract_tag_by_cell_adjacency_candidates(
     candidates: list[str],
     direction: str,
 ) -> tuple[str | None, dict]:
-    verticals, horizontals = extract_rulings(page)
-    match_cell, debug = find_cell_by_candidates(page, candidates, verticals, horizontals)
-    if not match_cell:
+    key_cell, key_debug = find_anchor_cell_strict(page, candidates)
+    debug = {"direction": direction}
+    debug.update(key_debug)
+    if not key_cell:
+        debug["error"] = "match_cell_not_found"
         return None, debug
 
-    label_text = get_cell_text(page, match_cell)
-    debug["cell_norm"] = norm_text(label_text)
-
-    key_words = []
-    for x0, y0, x1, y1, w, *_ in page.get_text("words", clip=match_cell) or []:
-        wn = norm_text(w)
-        if not wn:
-            continue
-        if any(wn in norm_text(c) or norm_text(c) in wn for c in candidates):
-            key_words.append((x0, y0, x1, y1))
-    if not key_words:
-        candidates_words = []
-        for x0, y0, x1, y1, w, *_ in page.get_text("words") or []:
-            wn = norm_text(w)
-            if wn and any(wn == norm_text(c) or wn in norm_text(c) or norm_text(c) in wn for c in candidates):
-                candidates_words.append((x0, y0, x1, y1))
-        if candidates_words:
-            candidates_words.sort(key=lambda r: abs(r[1] - match_cell.y0))
-            key_words = candidates_words
-    if key_words:
-        key_bbox = fitz.Rect(
-            min(r[0] for r in key_words),
-            min(r[1] for r in key_words),
-            max(r[2] for r in key_words),
-            max(r[3] for r in key_words),
-        )
-    else:
-        key_bbox = match_cell
-    debug["key_bbox"] = key_bbox
-
-    eps = 0.5
-    row_pad = max(6.0, match_cell.height * 0.6)
-    row_y0 = match_cell.y0 - row_pad
-    row_y1 = match_cell.y1 + row_pad
-    row_band = fitz.Rect(page.rect.x0, row_y0, page.rect.x1, row_y1)
-    debug.update({"row_pad": row_pad, "row_y0": row_y0, "row_y1": row_y1})
-
-    xs_row = _uniq_sorted([
-        x for x, y0, y1 in verticals
-        if y1 >= row_y0 - 1 and y0 <= row_y1 + 1
-    ])
-    ys_col = _uniq_sorted([
-        y for y, x0, x1 in horizontals
-        if x1 >= match_cell.x0 - 1 and x0 <= match_cell.x1 + 1
-    ])
-    debug["xs_row_len"] = len(xs_row)
-    debug["xs_row_head"] = xs_row[:6]
-    debug["ys_col_len"] = len(ys_col)
-    debug["ys_col_head"] = ys_col[:6]
-
-    divider_x = next((x for x in xs_row if x > key_bbox.x1 + 0.5), None)
-    if divider_x is None:
-        divider_x = key_bbox.x1 + 2.0
-    divider_left_x = next((x for x in reversed(xs_row) if x < key_bbox.x0 - 0.5), None)
-    if divider_left_x is None:
-        divider_left_x = key_bbox.x0 - 2.0
-    debug["divider_x"] = divider_x
-    debug["divider_left_x"] = divider_left_x
+    verticals, horizontals = extract_rulings(page)
+    key_left, key_top, key_right, key_bottom = key_cell.x0, key_cell.y0, key_cell.x1, key_cell.y1
+    row_mid = (key_top + key_bottom) / 2.0
+    col_mid = (key_left + key_right) / 2.0
+    xs = [round(x, 1) for x, y0, y1 in verticals if y0 - 1 <= row_mid <= y1 + 1]
+    ys = [round(y, 1) for y, x0, x1 in horizontals if x0 - 1 <= col_mid <= x1 + 1]
 
     direction = (direction or "RIGHT").upper()
-    value_cell = None
     margin = 36
-    eps2 = 1.0
     if direction == "RIGHT":
-        x0 = divider_x
-        x1 = next((x for x in xs_row if x > x0 + 1.0), None)
-        if x1 is None:
-            x1 = page.rect.x1 - margin
-        value_cell = fitz.Rect(x0, row_y0, x1, row_y1)
+        right_x = min([x for x in xs if x > key_right + 0.5], default=page.rect.x1 - margin)
+        value_cell = fitz.Rect(key_right, key_top, right_x, key_bottom)
     elif direction == "LEFT":
-        x1 = next((x for x in reversed(xs_row) if x <= match_cell.x0 + eps2), None)
-        if x1 is None:
-            x1 = match_cell.x0 - 1.0
-        x0 = next((x for x in reversed(xs_row) if x < x1 - 1.0), None)
-        if x0 is None:
-            x0 = page.rect.x0 + margin
-        value_cell = fitz.Rect(x0, row_y0, x1, row_y1)
+        left_x = max([x for x in xs if x < key_left - 0.5], default=page.rect.x0 + margin)
+        value_cell = fitz.Rect(left_x, key_top, key_left, key_bottom)
     elif direction == "DOWN":
-        y0_down = next((y for y in ys_col if y > match_cell.y1 + eps), None)
-        if y0_down is None:
-            y0_down = match_cell.y1 + 1.0
-        y1_down = next((y for y in ys_col if y > y0_down + eps), None)
-        if y1_down is None:
-            y1_down = row_y1
-        value_cell = fitz.Rect(match_cell.x0, y0_down, match_cell.x1, y1_down)
+        down_y = min([y for y in ys if y > key_bottom + 0.5], default=page.rect.y1 - margin)
+        value_cell = fitz.Rect(key_left, key_bottom, key_right, down_y)
     else:
-        y1_up = next((y for y in reversed(ys_col) if y < match_cell.y0 - eps), None)
-        if y1_up is None:
-            y1_up = match_cell.y0 - 1.0
-        y0_up = next((y for y in reversed(ys_col) if y < y1_up - eps), None)
-        if y0_up is None:
-            y0_up = row_y0
-        value_cell = fitz.Rect(match_cell.x0, y0_up, match_cell.x1, y1_up)
+        up_y = max([y for y in ys if y < key_top - 0.5], default=page.rect.y0 + margin)
+        value_cell = fitz.Rect(key_left, up_y, key_right, key_top)
 
-    debug["value_cell_before_fallback"] = value_cell
+    debug["key_cell_rect"] = key_cell
+    debug["value_cell_rect"] = value_cell
+    if value_cell.width <= 10 or value_cell.height <= 5:
+        debug["error"] = "adjacent_cell_not_found"
+        return None, debug
 
     raw = get_cell_text(page, value_cell)
-    debug["raw_preview"] = (raw or "")[:80]
-    fallback_words_used = False
-    fallback_words_count = 0
-    picked_words_sample = []
-    if not normalize_cell_text(raw):
-        words = page.get_text("words", clip=row_band) or []
-        picked = []
-        if direction == "RIGHT":
-            for x0, y0, x1, y1, w, *_ in words:
-                if x0 < divider_x - 0.5:
-                    continue
-                overlap = max(0.0, min(y1, row_y1) - max(y0, row_y0))
-                height = max(y1 - y0, 1.0)
-                if overlap / height >= 0.4:
-                    picked.append((x0, y0, x1, y1))
-        elif direction == "LEFT":
-            for x0, y0, x1, y1, w, *_ in words:
-                if x1 > divider_left_x + 0.5:
-                    continue
-                overlap = max(0.0, min(y1, row_y1) - max(y0, row_y0))
-                height = max(y1 - y0, 1.0)
-                if overlap / height >= 0.4:
-                    picked.append((x0, y0, x1, y1))
-        elif direction == "DOWN":
-            for x0, y0, x1, y1, w, *_ in words:
-                if y0 < match_cell.y1 - 1.0:
-                    continue
-                overlap = max(0.0, min(x1, match_cell.x1) - max(x0, match_cell.x0))
-                width = max(x1 - x0, 1.0)
-                if overlap / width >= 0.4:
-                    picked.append((x0, y0, x1, y1))
-        else:
-            for x0, y0, x1, y1, w, *_ in words:
-                if y1 > match_cell.y0 + 1.0:
-                    continue
-                overlap = max(0.0, min(x1, match_cell.x1) - max(x0, match_cell.x0))
-                width = max(x1 - x0, 1.0)
-                if overlap / width >= 0.4:
-                    picked.append((x0, y0, x1, y1))
-        picked_words_sample = picked[:5]
-        fallback_words_count = len(picked)
-        if picked:
-            x0_min = min(r[0] for r in picked) - 2
-            y0_min = min(r[1] for r in picked) - 2
-            x1_max = max(r[2] for r in picked) + 2
-            y1_max = max(r[3] for r in picked) + 2
-            value_cell = fitz.Rect(x0_min, y0_min, x1_max, y1_max)
-            raw = get_cell_text(page, value_cell)
-            fallback_words_used = True
-            debug["raw_preview"] = (raw or "")[:80]
-
-    debug.update({
-        "fallback_words_used": fallback_words_used,
-        "fallback_words_count": fallback_words_count,
-        "picked_words_sample": picked_words_sample,
-        "value_cell_after_fallback": value_cell if fallback_words_used else None,
-        "value_cell": value_cell,
-        "raw": raw,
-    })
-
+    debug["value_cell_text_raw"] = raw
+    debug["value_cell_text_raw_preview"] = (raw or "")[:200]
     normed = normalize_cell_text(raw)
-    debug["norm"] = normed
+    debug["value_cell_text_normed"] = normed
     if not normed:
         debug["error"] = "adjacent_cell_empty"
         return None, debug
@@ -1347,6 +1176,7 @@ __all__ = [
     "extract_candidates_in_cell_text",
     "extract_value_by_regex",
     "fit_text_to_box",
+    "find_anchor_cell_strict",
     "find_cell_by_candidates",
     "find_adjacent_cell_with_tolerance",
     "get_cell_text_cached",

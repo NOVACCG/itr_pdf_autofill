@@ -36,8 +36,8 @@ APP_VERSION = "V1.0.3"
 
 from itr_modules.shared.paths import BASE_DIR, ensure_output_dir, ensure_report_dir, get_batch_id, open_in_file_explorer
 from itr_modules.shared.pdf_utils import (
+    extract_candidates_in_cell_text,
     extract_tag_by_cell_adjacency,
-    extract_value_by_regex,
     fit_text_to_box,
     norm_text,
     normalize_cell_text,
@@ -59,7 +59,7 @@ ensure_report_dir(MODULE_NAME, get_batch_id())
 DEFAULT_PAGE1_MARK_RE = re.compile(r"Page\s*1\s*of\s*(\d+)", re.IGNORECASE)
 DEFAULT_TAG_PATTERN = r"TAG\s*NO\.\s*:\s*([A-Za-z0-9\-\._/]+)"
 DEFAULT_TAG_RE = re.compile(DEFAULT_TAG_PATTERN, re.IGNORECASE)
-DEFAULT_VALUE_REGEX = DEFAULT_TAG_PATTERN
+DEFAULT_VALUE_REGEX = r"([A-Za-z0-9\-\._/]+)"
 TAG_DIRECTION_OPTIONS = ["RIGHT", "LEFT", "DOWN", "UP"]
 
 SIDE_OPTIONS = ["", "LEFT", "RIGHT"]
@@ -654,6 +654,34 @@ def pdf_position_test(pdf_path: str, preset: dict, fields: List[dict]) -> Tuple[
             page.draw_rect(cell_rect, color=(1, 0, 0), width=1)  # 红框：可填写方框(cell)
             logs.append(f"[OK] {name} (p{rel_i})")
 
+    match_cfg = preset.get("match", {})
+    key_norm = norm_text(match_cfg.get("key_name", "TAG"))
+    tag_direction = (match_cfg.get("tag_direction", "RIGHT") or "RIGHT").upper()
+    page = doc[set_start - 1]
+    tag_text, tag_debug = extract_tag_by_cell_adjacency(page, key_norm, tag_direction)
+    key_cell_rect = tag_debug.get("key_cell_rect")
+    value_cell_rect = tag_debug.get("value_cell_rect")
+    if key_cell_rect:
+        page.draw_rect(key_cell_rect, color=(0, 0, 1), width=1.2)
+    if value_cell_rect:
+        page.draw_rect(value_cell_rect, color=(1, 0, 0), width=1.2)
+    value_raw_preview = (tag_debug.get("value_cell_text_raw") or "")[:200]
+    value_regex = (match_cfg.get("pdf_extract_regex", "") or "").strip() or DEFAULT_VALUE_REGEX
+    try:
+        candidates = extract_candidates_in_cell_text(
+            normalize_cell_text(tag_debug.get("value_cell_text_raw") or ""), value_regex
+        )
+    except re.error:
+        candidates = []
+    logs.append(
+        f"TAG pdf={os.path.basename(pdf_path)} start_page=P1 anchor_norm={key_norm} "
+        f"key_cell_rect={key_cell_rect} key_cell_text_raw=\"{tag_debug.get('key_cell_text_raw', '')}\" "
+        f"key_cell_text_norm=\"{tag_debug.get('key_cell_text_norm', '')}\" direction={tag_direction} "
+        f"value_cell_rect={value_cell_rect} value_cell_text_raw_preview=\"{value_raw_preview}\" "
+        f"value_regex=\"{value_regex}\" tag_candidates={candidates} tag_pick=\"{tag_text}\" "
+        "tag_source=CELL_ADJACENT"
+    )
+
     base = os.path.basename(pdf_path)
     ts = batch_id()
     out_name = f"{os.path.splitext(base)[0]}__test_{preset.get('preset_name', 'preset')}__{ts}.pdf"
@@ -921,7 +949,7 @@ class ITRAutofillTab(ttk.Frame):
 
         mk1 = ttk.Frame(mk)
         mk1.pack(fill="x", padx=10, pady=6)
-        ttk.Label(mk1, text="Key 归一值(锚点)").pack(side="left")
+        ttk.Label(mk1, text="Key 归一值(锚点，例：TAGNO)").pack(side="left")
         self.ent_key_name = ttk.Entry(mk1, width=20)
         self.ent_key_name.pack(side="left", padx=8)
 
@@ -1629,21 +1657,17 @@ class ITRAutofillTab(ttk.Frame):
         direction = (match_cfg.get("tag_direction", "RIGHT") or "RIGHT").upper()
         page1 = doc[start_page - 1]
 
-        print(f"Key 归一值(锚点)={key_norm}")
+        print(f"pdf={os.path.basename(pdf_path)} start_page=P{start_page} anchor_norm={key_norm}")
         value_normed, debug = extract_tag_by_cell_adjacency(page1, key_norm, direction)
-        cell_norm = debug.get("cell_norm", "")
-        cell_rect = debug.get("match_cell", None)
-        if cell_norm and cell_rect:
-            print(f"命中 key_norm={key_norm} cell_norm={cell_norm} cell_rect={cell_rect}")
+        key_cell_rect = debug.get("key_cell_rect")
+        key_cell_text_raw = debug.get("key_cell_text_raw", "")
+        key_cell_text_norm = debug.get("key_cell_text_norm", "")
+        value_cell_rect = debug.get("value_cell_rect")
+        value_raw = debug.get("value_cell_text_raw", "") or ""
+        value_raw_preview = (value_raw or "")[:200]
         print(
-            "debug key_bbox={key_bbox} divider_x={divider_x} value_cell_before_fallback={value_cell} "
-            "fallback_words_count={fallback_words_count} raw_preview={raw_preview}".format(
-                key_bbox=debug.get("key_bbox"),
-                divider_x=debug.get("divider_x"),
-                value_cell=debug.get("value_cell_before_fallback"),
-                fallback_words_count=debug.get("fallback_words_count"),
-                raw_preview=debug.get("raw_preview"),
-            )
+            f"key_cell_rect={key_cell_rect} key_cell_text_raw=\"{key_cell_text_raw}\" "
+            f"key_cell_text_norm=\"{key_cell_text_norm}\" direction={direction}"
         )
         if not value_normed:
             if debug.get("error") == "match_cell_not_found":
@@ -1652,15 +1676,23 @@ class ITRAutofillTab(ttk.Frame):
                 print(f"找到 key_norm 单元格，但 direction={direction} 的相邻单元格不存在/为空")
             return "", "missing"
 
-        value_raw = normalize_cell_text(debug.get("raw") or value_normed)
+        value_normed = normalize_cell_text(value_raw or value_normed)
         value_regex = (match_cfg.get("pdf_extract_regex", "") or "").strip() or DEFAULT_VALUE_REGEX
         try:
-            tag_value = extract_value_by_regex(value_raw, value_regex)
+            candidates = extract_candidates_in_cell_text(value_normed, value_regex)
         except re.error as exc:
             print(f"正则无效，无法截取：{exc}")
             return "", "missing"
+        if not candidates:
+            print(f"value_cell 有文本，但 regex 截取失败；value_raw={value_raw_preview}; regex={value_regex}")
+            return "", "missing"
+
+        tag_value = ""
+        if len(candidates) == 1:
+            tag_value = candidates[0]
+        else:
+            tag_value, _ = self._thread_tag_candidate_chooser(os.path.basename(pdf_path), candidates)
         if not tag_value:
-            print(f"value_cell 有文本，但 regex 截取失败；value_raw={value_raw}; regex={value_regex}")
             return "", "missing"
 
         tag_value = norm_key_value(tag_value)
@@ -1668,8 +1700,13 @@ class ITRAutofillTab(ttk.Frame):
             suf_up = norm_key_value(suf)
             if suf_up and tag_value.endswith(suf_up):
                 tag_value = tag_value[: -len(suf_up)]
-        self.tag_choice_cache[cache_key] = {"value": tag_value, "source": "cell_adjacency"}
-        return tag_value, "cell_adjacency"
+        print(
+            f"value_cell_rect={value_cell_rect} value_cell_text_raw_preview=\"{value_raw_preview}\" "
+            f"value_regex=\"{value_regex}\" tag_candidates={candidates} tag_pick=\"{tag_value}\" "
+            "tag_source=CELL_ADJACENT"
+        )
+        self.tag_choice_cache[cache_key] = {"value": tag_value, "source": "CELL_ADJACENT"}
+        return tag_value, "CELL_ADJACENT"
 
     def _preview_worker(self, preset: dict):
         try:
