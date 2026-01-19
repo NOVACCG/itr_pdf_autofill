@@ -12,6 +12,7 @@ NA 自动勾选模块（Tab 正式版 UI）- v3.5（支持批量导入PDF + NA�
 
 说明：
 - 目前支持“解析 + 测试画框 + NA自动打勾（列格式化：用表头列边界 + 横线切行）”。
+- Phase 2 说明：该文件仅作为技术路线参考，UI 将在后续版本移除。
 """
 
 import csv
@@ -36,7 +37,26 @@ from itr_modules.shared.paths import (
     get_batch_id,
     open_in_file_explorer,
 )
-from itr_modules.shared.pdf_utils import fit_text_to_box
+from itr_modules.shared.pdf_utils import (
+    build_table_row_lines,
+    cell_rect_for_word,
+    draw_checkmark,
+    extract_rulings,
+    find_cell_by_exact_norm,
+    find_ex_concept_cells,
+    find_lowest_header_anchor,
+    find_ok_na_pl_cells,
+    fit_text_to_box,
+    get_cell_text,
+    header_row_band,
+    is_pure_int,
+    norm_text,
+    parse_pages_per_itr_regex,
+    rect_between_lines,
+    _cell_text_from_row_words,
+    _snap_col_bounds,
+    _unique_sorted_x_from_verticals,
+)
 
 # -------------------------
 # 输出目录（统一 output/，按模块/输出类型/批次）
@@ -54,367 +74,8 @@ MODULE_NAME = "na_check"
 REPORT_MODULE_NAME = "na_check"
 
 
-def norm_text(s: str) -> str:
-    """归一化：大写 + 去掉非字母数字（空格/换行/符号都去掉）"""
-    return re.sub(r"[^A-Z0-9]+", "", (s or "").upper())
-
-
-def parse_pages_per_itr_regex(doc: fitz.Document, pattern: str, scan_pages: int) -> int | None:
-    """从前 scan_pages 页，用正则抓取 'Page x of y' 的 y（每套 ITR 页数）。"""
-    try:
-        reg = re.compile(pattern, flags=re.IGNORECASE)
-    except re.error:
-        return None
-
-    n = min(max(scan_pages, 1), doc.page_count)
-    for i in range(n):
-        txt = doc[i].get_text("text") or ""
-        m = reg.search(txt)
-        if m:
-            try:
-                return int(m.group(1))
-            except Exception:
-                return None
-    return None
-
-
-# -------------------------
-# 表格线提取：横/竖线
-# -------------------------
-def extract_rulings(page: fitz.Page, tol=1.5):
-    verticals = []
-    horizontals = []
-
-    drawings = page.get_drawings()
-    for d in drawings:
-        for it in d.get("items", []):
-            if not it:
-                continue
-            kind = it[0]
-            if kind == "l":  # line
-                (x0, y0) = it[1]
-                (x1, y1) = it[2]
-                if abs(x0 - x1) <= tol:
-                    x = (x0 + x1) / 2.0
-                    verticals.append((x, min(y0, y1), max(y0, y1)))
-                elif abs(y0 - y1) <= tol:
-                    y = (y0 + y1) / 2.0
-                    horizontals.append((y, min(x0, x1), max(x0, x1)))
-            elif kind == "re":  # rectangle path
-                r = it[1]
-                if isinstance(r, fitz.Rect):
-                    x0, y0, x1, y1 = r.x0, r.y0, r.x1, r.y1
-                    verticals.extend([(x0, y0, y1), (x1, y0, y1)])
-                    horizontals.extend([(y0, x0, x1), (y1, x0, x1)])
-
-    verticals = [(x, y0, y1) for (x, y0, y1) in verticals if (y1 - y0) > 6]
-    horizontals = [(y, x0, x1) for (y, x0, x1) in horizontals if (x1 - x0) > 6]
-    return verticals, horizontals
-
-
-def cell_rect_for_word(word_rect: fitz.Rect, verticals, horizontals):
-    cx0, cy0, cx1, cy1 = word_rect.x0, word_rect.y0, word_rect.x1, word_rect.y1
-    y_mid = (cy0 + cy1) / 2.0
-    x_mid = (cx0 + cx1) / 2.0
-
-    left = None
-    right = None
-    for x, y0, y1 in verticals:
-        if y0 - 2 <= y_mid <= y1 + 2:
-            if x <= cx0 + 2 and (left is None or x > left):
-                left = x
-            if x >= cx1 - 2 and (right is None or x < right):
-                right = x
-
-    top = None
-    bottom = None
-    for y, x0, x1 in horizontals:
-        if x0 - 2 <= x_mid <= x1 + 2:
-            if y <= cy0 + 2 and (top is None or y > top):
-                top = y
-            if y >= cy1 - 2 and (bottom is None or y < bottom):
-                bottom = y
-
-    if left is None or right is None or top is None or bottom is None:
-        return None
-    return fitz.Rect(left + 0.3, top + 0.3, right - 0.3, bottom - 0.3)
-
-
-def get_cell_text(page: fitz.Page, cell: fitz.Rect) -> str:
-    return (page.get_text("text", clip=cell) or "").strip()
-
-
-def _norm_join_words(words_in_row):
-    """把一行内的 words (PyMuPDF words 元组)按从左到右拼接成文本。"""
-    if not words_in_row:
-        return ""
-    # words: (x0,y0,x1,y1, text, block, line, word)
-    words_in_row = sorted(words_in_row, key=lambda w: (w[0], w[1]))
-    return " ".join((w[4] or "").strip() for w in words_in_row if (w[4] or "").strip())
-
-
-def _cell_text_from_row_words(row_words, x0, x1):
-    """从“该行的 words 列表”里取出中心点落在 [x0,x1] 的词，拼成该单元格文本。"""
-    if not row_words:
-        return ""
-    picked = []
-    for w in row_words:
-        wx0, wy0, wx1, wy1 = w[0], w[1], w[2], w[3]
-        cx = (wx0 + wx1) / 2.0
-        if x0 <= cx <= x1:
-            picked.append(w)
-    return _norm_join_words(picked)
-
-
-# -------------------------
-# “列格式化”辅助：用表头列边界 + 横线切行
-# -------------------------
-def _uniq_sorted(vals, tol=0.8):
-    """排序+去重：同一位置(差<=tol)视为一条线。"""
-    vals = sorted(vals)
-    out = []
-    for v in vals:
-        if not out or abs(v - out[-1]) > tol:
-            out.append(v)
-    return out
-
-
-def build_table_row_lines(page: fitz.Page, horizontals, x_left: float, x_right: float, y_start: float, min_span_pad=8.0):
-    """从页面横线里筛出能覆盖表格宽度的横线，返回 y 坐标列表（已去重排序）。"""
-    ys = []
-    for y, x0, x1 in horizontals:
-        # 这条横线要足够“横跨”表格宽度
-        if x0 <= x_left + min_span_pad and x1 >= x_right - min_span_pad and y >= y_start - 2:
-            ys.append(y)
-    return _uniq_sorted(ys)
-
-
-def is_pure_int(s: str) -> bool:
-    s = (s or "").strip()
-    return bool(s) and s.isdigit()
-
-
-def rect_between_lines(x0, x1, y0, y1, pad=0.6):
-    return fitz.Rect(x0 + pad, y0 + pad, x1 - pad, y1 - pad)
-
-
 def _label_rect_above(cell: fitz.Rect, height: float = 8.0) -> fitz.Rect:
     return fitz.Rect(cell.x0, cell.y0 - height, cell.x1, cell.y0)
-
-
-def _unique_sorted_x_from_verticals(verticals) -> list[float]:
-    """从竖线集合里提取去重后的 x 坐标（排序）。
-
-    verticals 可能是:
-    - (x, y0, y1)  由 extract_rulings() 生成
-    - (x0, y0, x1, y1)  兼容旧写法/外部传入
-    本函数只关心 x 坐标。
-    """
-    xs: list[float] = []
-    for v in verticals or []:
-        if not v:
-            continue
-        # 兼容 3 元/4 元元组
-        if len(v) == 3:
-            x, _, _ = v
-            xs.append(float(x))
-        elif len(v) >= 4:
-            x0, _, _, _ = v[:4]
-            xs.append(float(x0))
-        else:
-            # 不认识的结构，跳过
-            continue
-    xs = sorted({round(x, 2) for x in xs})
-    return xs
-
-
-def _snap_col_bounds(xs: list[float], x_center: float) -> tuple[float, float] | None:
-    """给定一堆竖线 x 坐标，返回能“包住”x_center 的相邻两条竖线 (xL, xR)。
-
-    如果找不到严格包住的，就取距离最近的一段。
-    """
-    if not xs or len(xs) < 2:
-        return None
-    # 先尝试严格包住
-    for i in range(len(xs) - 1):
-        if xs[i] - 1.0 <= x_center <= xs[i + 1] + 1.0:
-            return (xs[i], xs[i + 1])
-    # 兜底：取最近的段（按段中心距离）
-    best = None
-    best_d = 1e18
-    for i in range(len(xs) - 1):
-        c = (xs[i] + xs[i + 1]) / 2.0
-        d = abs(c - x_center)
-        if d < best_d:
-            best_d = d
-            best = (xs[i], xs[i + 1])
-    return best
-
-
-# -------------------------
-# 方法A：先粗搜后“单元格归一化严格匹配”
-# -------------------------
-def find_cell_by_exact_norm(page: fitz.Page, target: str, verticals, horizontals, search_clip: fitz.Rect | None = None):
-    target_norm = norm_text(target)
-    words = page.get_text("words", clip=search_clip) if search_clip else page.get_text("words")
-
-    candidates = []
-    for x0, y0, x1, y1, w, *_ in words:
-        wn = norm_text(w)
-        if not wn:
-            continue
-        if wn in target_norm or target_norm in wn:
-            cell = cell_rect_for_word(fitz.Rect(x0, y0, x1, y1), verticals, horizontals)
-            if cell:
-                candidates.append(cell)
-
-    # 去重
-    uniq = []
-    for c in candidates:
-        if all(
-            not (
-                abs(c.x0 - u.x0) < 1
-                and abs(c.y0 - u.y0) < 1
-                and abs(c.x1 - u.x1) < 1
-                and abs(c.y1 - u.y1) < 1
-            )
-            for u in uniq
-        ):
-            uniq.append(c)
-
-    for cell in uniq:
-        if norm_text(get_cell_text(page, cell)) == target_norm:
-            return cell
-    return None
-
-
-def find_lowest_header_anchor(page: fitz.Page, candidates: list[str], verticals, horizontals):
-    cand_norms = [norm_text(x) for x in candidates]
-    words = page.get_text("words")
-    hits = []
-    for x0, y0, x1, y1, w, *_ in words:
-        if norm_text(w) in cand_norms:
-            cell = cell_rect_for_word(fitz.Rect(x0, y0, x1, y1), verticals, horizontals)
-            if not cell:
-                continue
-            if norm_text(get_cell_text(page, cell)) in cand_norms:
-                hits.append(cell)
-    if not hits:
-        return None
-    hits.sort(key=lambda r: r.y0, reverse=True)
-    return hits[0]
-
-
-def header_row_band(no_cell: fitz.Rect, pad=3.0):
-    return fitz.Rect(0, no_cell.y0 - pad, 10000, no_cell.y1 + pad)
-
-
-def collect_ex_header_cells(page: fitz.Page, row_band: fitz.Rect, verticals, horizontals):
-    """
-    收集底表表头里“九个防爆缩写列”（ EXE / EXDE / EXD / EXI ...）。
-
-    关键修复：以前从 words 里抓 EX 开头的词，遇到换行（EX\nDE）会只抓到 "EX"。
-    现在改成“按格子取文本”：
-    - 在表头 band 内，利用竖线把表头行切成一格一格
-    - 对每一格读取完整文本并归一化
-    - 如果格子归一化文本符合 EX[A-Z0-9]{1,3}，则认为是一个缩写列头
-    """
-    band = row_band
-    cy = (band.y0 + band.y1) / 2
-
-    # 找到能覆盖表头 band 的所有竖线 x
-    xs = []
-    for vx, vy0, vy1 in verticals:
-        if vy0 <= cy <= vy1:
-            xs.append(float(vx))
-    xs = sorted(set(round(x, 2) for x in xs))
-    if len(xs) < 2:
-        return []
-
-    ex_pat = re.compile(r"^EX[A-Z0-9]{1,3}$")
-    out = []
-
-    # 逐列扫描（相邻两条竖线定义一个格子宽度）
-    for i in range(len(xs) - 1):
-        x0, x1 = xs[i], xs[i + 1]
-        # 排除极窄的“假列”
-        if x1 - x0 < 6:
-            continue
-
-        rr = fitz.Rect(x0 + 0.6, band.y0 + 0.6, x1 - 0.6, band.y1 - 0.6)
-        txt = norm_text(get_cell_text(page, rr))
-        if not txt:
-            continue
-        # 只要格子里完整文本符合 EX* 缩写，就收录
-        if ex_pat.match(txt):
-            out.append((txt, rr))
-
-    # 去重并按 x0 排序
-    uniq = {}
-    for k, rr in out:
-        if k not in uniq:
-            uniq[k] = rr
-    items = sorted(uniq.items(), key=lambda kv: kv[1].x0)
-    return [(k, rr) for k, rr in items]
-
-
-def find_ok_na_pl_cells(page: fitz.Page, row_band: fitz.Rect, verticals, horizontals):
-    res = {}
-    for key in ["OK", "NA", "PL"]:
-        cell = find_cell_by_exact_norm(page, key, verticals, horizontals, search_clip=row_band)
-        if cell:
-            res[key] = cell
-    return res
-
-
-def find_ex_concept_cells(page: fitz.Page, verticals, horizontals):
-    label = find_cell_by_exact_norm(page, "Ex Concept", verticals, horizontals)
-    if not label:
-        return None, None
-
-    y_mid = (label.y0 + label.y1) / 2
-    right_lines = [x for x, y0, y1 in verticals if (y0 - 2 <= y_mid <= y1 + 2) and x > label.x1 + 1]
-    if not right_lines:
-        return label, None
-    right_edge = min(right_lines)
-
-    value_cell = fitz.Rect(label.x1 + 0.3, label.y0 + 0.3, right_edge - 0.3, label.y1 - 0.3)
-    if not norm_text(get_cell_text(page, value_cell)).startswith("EX"):
-        return label, None
-    return label, value_cell
-
-
-def draw_checkmark(page: fitz.Page, rr: fitz.Rect, width: float = 1.6):
-    """
-    画勾：用两条线组成 √，避免写入“✓”字符时因字体缺失变成小点。
-
-    ✅ 关键优化：不再按“长方形整格”比例画勾，而是：
-    - 取 rr 的最短边作为边长，在单元格中心构造一个正方形绘制区域
-    - 在该正方形内画 √，保证勾永远不被拉长，打印更清晰
-    """
-    if rr is None:
-        return
-
-    # 以最短边构造“正方形画布”
-    side = max(min(rr.width, rr.height), 1.0)
-    cx = (rr.x0 + rr.x1) / 2.0
-    cy = (rr.y0 + rr.y1) / 2.0
-    sq = fitz.Rect(cx - side / 2.0, cy - side / 2.0, cx + side / 2.0, cy + side / 2.0)
-
-    # 内缩：避免碰到格子边框
-    inset = max(side * 0.18, 1.0)
-    r = fitz.Rect(sq.x0 + inset, sq.y0 + inset, sq.x1 - inset, sq.y1 - inset)
-
-    w = r.width
-    h = r.height
-
-    # √ 的三点（相对于正方形 r）
-    p1 = (r.x0 + 0.18 * w, r.y0 + 0.55 * h)
-    p2 = (r.x0 + 0.42 * w, r.y0 + 0.78 * h)
-    p3 = (r.x0 + 0.82 * w, r.y0 + 0.22 * h)
-
-    page.draw_line(p1, p2, width=width)
-    page.draw_line(p2, p3, width=width)
 
 
 def open_folder(path: Path):
