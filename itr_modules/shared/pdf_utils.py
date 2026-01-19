@@ -338,85 +338,125 @@ def extract_tag_by_cell_adjacency(
         debug["error"] = "match_cell_not_found"
         return None, debug
 
-    cx = (match_cell.x0 + match_cell.x1) / 2.0
-    cy = (match_cell.y0 + match_cell.y1) / 2.0
     eps = 0.5
-    xs_row = _uniq_sorted([x for x, y0, y1 in verticals if y0 - eps <= cy <= y1 + eps])
-    ys_col = _uniq_sorted([y for y, x0, x1 in horizontals if x0 - eps <= cx <= x1 + eps])
+    row_pad = max(6.0, match_cell.height * 0.6)
+    row_y0 = match_cell.y0 - row_pad
+    row_y1 = match_cell.y1 + row_pad
+    row_band = fitz.Rect(page.rect.x0, row_y0, page.rect.x1, row_y1)
+    debug.update({"row_pad": row_pad, "row_y0": row_y0, "row_y1": row_y1})
+
+    xs_row = _uniq_sorted([
+        x for x, y0, y1 in verticals
+        if y1 >= row_y0 - 1 and y0 <= row_y1 + 1
+    ])
+    ys_col = _uniq_sorted([
+        y for y, x0, x1 in horizontals
+        if x1 >= match_cell.x0 - 1 and x0 <= match_cell.x1 + 1
+    ])
     debug["xs_row_len"] = len(xs_row)
     debug["xs_row_head"] = xs_row[:6]
     debug["ys_col_len"] = len(ys_col)
     debug["ys_col_head"] = ys_col[:6]
 
-    fallback_used = False
-    y0 = max((y for y in ys_col if y <= cy), default=match_cell.y0 - 1)
-    y1 = min((y for y in ys_col if y >= cy), default=match_cell.y1 + 1)
-    if not ys_col or y1 <= y0:
-        y0, y1 = match_cell.y0 - 1, match_cell.y1 + 1
-        fallback_used = True
-        debug["fallback_reason"] = "missing_horizontal"
-
     direction = (direction or "RIGHT").upper()
     value_cell = None
     margin = 36
-    cell_margin = 1.0
     eps2 = 1.0
     if direction == "RIGHT":
-        x0_line = next((x for x in xs_row if x >= match_cell.x1 - eps2), None)
-        if x0_line is not None:
-            x0 = x0_line
-        else:
-            x0 = match_cell.x1 + cell_margin
-            fallback_used = True
-            debug["fallback_reason"] = "missing_vertical"
-        x1 = next((x for x in xs_row if x > x0 + eps), None)
+        x0 = next((x for x in xs_row if x >= match_cell.x1 - eps2), None)
+        if x0 is None:
+            x0 = match_cell.x1 + 1.0
+        x1 = next((x for x in xs_row if x > x0 + 1.0), None)
         if x1 is None:
             x1 = page.rect.x1 - margin
-            fallback_used = True
-            debug["fallback_reason"] = "missing_vertical"
-        value_cell = fitz.Rect(x0, y0, x1, y1)
+        value_cell = fitz.Rect(x0, row_y0, x1, row_y1)
     elif direction == "LEFT":
-        x1_line = next((x for x in reversed(xs_row) if x <= match_cell.x0 + eps2), None)
-        if x1_line is not None:
-            x1 = x1_line
-        else:
-            x1 = match_cell.x0 - cell_margin
-            fallback_used = True
-            debug["fallback_reason"] = "missing_vertical"
-        x0 = next((x for x in reversed(xs_row) if x < x1 - eps), None)
+        x1 = next((x for x in reversed(xs_row) if x <= match_cell.x0 + eps2), None)
+        if x1 is None:
+            x1 = match_cell.x0 - 1.0
+        x0 = next((x for x in reversed(xs_row) if x < x1 - 1.0), None)
         if x0 is None:
             x0 = page.rect.x0 + margin
-            fallback_used = True
-            debug["fallback_reason"] = "missing_vertical"
-        value_cell = fitz.Rect(x0, y0, x1, y1)
+        value_cell = fitz.Rect(x0, row_y0, x1, row_y1)
     elif direction == "DOWN":
         y0_down = next((y for y in ys_col if y > match_cell.y1 + eps), None)
         if y0_down is None:
-            debug["error"] = "adjacent_cell_not_found"
-            return None, debug
+            y0_down = match_cell.y1 + 1.0
         y1_down = next((y for y in ys_col if y > y0_down + eps), None)
         if y1_down is None:
-            y1_down = page.rect.y1 - margin
+            y1_down = row_y1
         value_cell = fitz.Rect(match_cell.x0, y0_down, match_cell.x1, y1_down)
     else:
         y1_up = next((y for y in reversed(ys_col) if y < match_cell.y0 - eps), None)
         if y1_up is None:
-            debug["error"] = "adjacent_cell_not_found"
-            return None, debug
+            y1_up = match_cell.y0 - 1.0
         y0_up = next((y for y in reversed(ys_col) if y < y1_up - eps), None)
         if y0_up is None:
-            y0_up = page.rect.y0 + margin
+            y0_up = row_y0
         value_cell = fitz.Rect(match_cell.x0, y0_up, match_cell.x1, y1_up)
 
-    debug.update({"y0": y0, "y1": y1})
-    if value_cell:
-        debug.update({"x0": value_cell.x0, "x1": value_cell.x1})
-    if fallback_used:
-        debug["fallback_used"] = True
+    debug["value_cell_before_fallback"] = value_cell
 
     raw = get_cell_text(page, value_cell)
+    debug["raw_preview"] = (raw or "")[:80]
+    fallback_words_used = False
+    fallback_words_count = 0
+    if not normalize_cell_text(raw):
+        words = page.get_text("words", clip=row_band) or []
+        picked = []
+        if direction == "RIGHT":
+            for x0, y0, x1, y1, w, *_ in words:
+                if x0 < match_cell.x1 - 1.0:
+                    continue
+                overlap = max(0.0, min(y1, row_y1) - max(y0, row_y0))
+                height = max(y1 - y0, 1.0)
+                if overlap / height >= 0.4:
+                    picked.append((x0, y0, x1, y1))
+        elif direction == "LEFT":
+            for x0, y0, x1, y1, w, *_ in words:
+                if x1 > match_cell.x0 + 1.0:
+                    continue
+                overlap = max(0.0, min(y1, row_y1) - max(y0, row_y0))
+                height = max(y1 - y0, 1.0)
+                if overlap / height >= 0.4:
+                    picked.append((x0, y0, x1, y1))
+        elif direction == "DOWN":
+            for x0, y0, x1, y1, w, *_ in words:
+                if y0 < match_cell.y1 - 1.0:
+                    continue
+                overlap = max(0.0, min(x1, match_cell.x1) - max(x0, match_cell.x0))
+                width = max(x1 - x0, 1.0)
+                if overlap / width >= 0.4:
+                    picked.append((x0, y0, x1, y1))
+        else:
+            for x0, y0, x1, y1, w, *_ in words:
+                if y1 > match_cell.y0 + 1.0:
+                    continue
+                overlap = max(0.0, min(x1, match_cell.x1) - max(x0, match_cell.x0))
+                width = max(x1 - x0, 1.0)
+                if overlap / width >= 0.4:
+                    picked.append((x0, y0, x1, y1))
+        fallback_words_count = len(picked)
+        if picked:
+            x0_min = min(r[0] for r in picked) - 2
+            y0_min = min(r[1] for r in picked) - 2
+            x1_max = max(r[2] for r in picked) + 2
+            y1_max = max(r[3] for r in picked) + 2
+            value_cell = fitz.Rect(x0_min, y0_min, x1_max, y1_max)
+            raw = get_cell_text(page, value_cell)
+            fallback_words_used = True
+            debug["raw_preview"] = (raw or "")[:80]
+
+    debug.update({
+        "fallback_words_used": fallback_words_used,
+        "fallback_words_count": fallback_words_count,
+        "value_cell_after_fallback": value_cell if fallback_words_used else None,
+        "value_cell": value_cell,
+        "raw": raw,
+    })
+
     normed = normalize_cell_text(raw)
-    debug.update({"value_cell": value_cell, "raw": raw, "norm": normed})
+    debug["norm"] = normed
     if not normed:
         debug["error"] = "adjacent_cell_empty"
         return None, debug
@@ -476,85 +516,125 @@ def extract_tag_by_cell_adjacency_candidates(
     if not match_cell:
         return None, debug
 
-    cx = (match_cell.x0 + match_cell.x1) / 2.0
-    cy = (match_cell.y0 + match_cell.y1) / 2.0
     eps = 0.5
-    xs_row = _uniq_sorted([x for x, y0, y1 in verticals if y0 - eps <= cy <= y1 + eps])
-    ys_col = _uniq_sorted([y for y, x0, x1 in horizontals if x0 - eps <= cx <= x1 + eps])
+    row_pad = max(6.0, match_cell.height * 0.6)
+    row_y0 = match_cell.y0 - row_pad
+    row_y1 = match_cell.y1 + row_pad
+    row_band = fitz.Rect(page.rect.x0, row_y0, page.rect.x1, row_y1)
+    debug.update({"row_pad": row_pad, "row_y0": row_y0, "row_y1": row_y1})
+
+    xs_row = _uniq_sorted([
+        x for x, y0, y1 in verticals
+        if y1 >= row_y0 - 1 and y0 <= row_y1 + 1
+    ])
+    ys_col = _uniq_sorted([
+        y for y, x0, x1 in horizontals
+        if x1 >= match_cell.x0 - 1 and x0 <= match_cell.x1 + 1
+    ])
     debug["xs_row_len"] = len(xs_row)
     debug["xs_row_head"] = xs_row[:6]
     debug["ys_col_len"] = len(ys_col)
     debug["ys_col_head"] = ys_col[:6]
 
-    fallback_used = False
-    y0 = max((y for y in ys_col if y <= cy), default=match_cell.y0 - 1)
-    y1 = min((y for y in ys_col if y >= cy), default=match_cell.y1 + 1)
-    if not ys_col or y1 <= y0:
-        y0, y1 = match_cell.y0 - 1, match_cell.y1 + 1
-        fallback_used = True
-        debug["fallback_reason"] = "missing_horizontal"
-
     direction = (direction or "RIGHT").upper()
     value_cell = None
     margin = 36
-    cell_margin = 1.0
     eps2 = 1.0
     if direction == "RIGHT":
-        x0_line = next((x for x in xs_row if x >= match_cell.x1 - eps2), None)
-        if x0_line is not None:
-            x0 = x0_line
-        else:
-            x0 = match_cell.x1 + cell_margin
-            fallback_used = True
-            debug["fallback_reason"] = "missing_vertical"
-        x1 = next((x for x in xs_row if x > x0 + eps), None)
+        x0 = next((x for x in xs_row if x >= match_cell.x1 - eps2), None)
+        if x0 is None:
+            x0 = match_cell.x1 + 1.0
+        x1 = next((x for x in xs_row if x > x0 + 1.0), None)
         if x1 is None:
             x1 = page.rect.x1 - margin
-            fallback_used = True
-            debug["fallback_reason"] = "missing_vertical"
-        value_cell = fitz.Rect(x0, y0, x1, y1)
+        value_cell = fitz.Rect(x0, row_y0, x1, row_y1)
     elif direction == "LEFT":
-        x1_line = next((x for x in reversed(xs_row) if x <= match_cell.x0 + eps2), None)
-        if x1_line is not None:
-            x1 = x1_line
-        else:
-            x1 = match_cell.x0 - cell_margin
-            fallback_used = True
-            debug["fallback_reason"] = "missing_vertical"
-        x0 = next((x for x in reversed(xs_row) if x < x1 - eps), None)
+        x1 = next((x for x in reversed(xs_row) if x <= match_cell.x0 + eps2), None)
+        if x1 is None:
+            x1 = match_cell.x0 - 1.0
+        x0 = next((x for x in reversed(xs_row) if x < x1 - 1.0), None)
         if x0 is None:
             x0 = page.rect.x0 + margin
-            fallback_used = True
-            debug["fallback_reason"] = "missing_vertical"
-        value_cell = fitz.Rect(x0, y0, x1, y1)
+        value_cell = fitz.Rect(x0, row_y0, x1, row_y1)
     elif direction == "DOWN":
         y0_down = next((y for y in ys_col if y > match_cell.y1 + eps), None)
         if y0_down is None:
-            debug["error"] = "adjacent_cell_not_found"
-            return None, debug
+            y0_down = match_cell.y1 + 1.0
         y1_down = next((y for y in ys_col if y > y0_down + eps), None)
         if y1_down is None:
-            y1_down = page.rect.y1 - margin
+            y1_down = row_y1
         value_cell = fitz.Rect(match_cell.x0, y0_down, match_cell.x1, y1_down)
     else:
         y1_up = next((y for y in reversed(ys_col) if y < match_cell.y0 - eps), None)
         if y1_up is None:
-            debug["error"] = "adjacent_cell_not_found"
-            return None, debug
+            y1_up = match_cell.y0 - 1.0
         y0_up = next((y for y in reversed(ys_col) if y < y1_up - eps), None)
         if y0_up is None:
-            y0_up = page.rect.y0 + margin
+            y0_up = row_y0
         value_cell = fitz.Rect(match_cell.x0, y0_up, match_cell.x1, y1_up)
 
-    debug.update({"y0": y0, "y1": y1})
-    if value_cell:
-        debug.update({"x0": value_cell.x0, "x1": value_cell.x1})
-    if fallback_used:
-        debug["fallback_used"] = True
+    debug["value_cell_before_fallback"] = value_cell
 
     raw = get_cell_text(page, value_cell)
+    debug["raw_preview"] = (raw or "")[:80]
+    fallback_words_used = False
+    fallback_words_count = 0
+    if not normalize_cell_text(raw):
+        words = page.get_text("words", clip=row_band) or []
+        picked = []
+        if direction == "RIGHT":
+            for x0, y0, x1, y1, w, *_ in words:
+                if x0 < match_cell.x1 - 1.0:
+                    continue
+                overlap = max(0.0, min(y1, row_y1) - max(y0, row_y0))
+                height = max(y1 - y0, 1.0)
+                if overlap / height >= 0.4:
+                    picked.append((x0, y0, x1, y1))
+        elif direction == "LEFT":
+            for x0, y0, x1, y1, w, *_ in words:
+                if x1 > match_cell.x0 + 1.0:
+                    continue
+                overlap = max(0.0, min(y1, row_y1) - max(y0, row_y0))
+                height = max(y1 - y0, 1.0)
+                if overlap / height >= 0.4:
+                    picked.append((x0, y0, x1, y1))
+        elif direction == "DOWN":
+            for x0, y0, x1, y1, w, *_ in words:
+                if y0 < match_cell.y1 - 1.0:
+                    continue
+                overlap = max(0.0, min(x1, match_cell.x1) - max(x0, match_cell.x0))
+                width = max(x1 - x0, 1.0)
+                if overlap / width >= 0.4:
+                    picked.append((x0, y0, x1, y1))
+        else:
+            for x0, y0, x1, y1, w, *_ in words:
+                if y1 > match_cell.y0 + 1.0:
+                    continue
+                overlap = max(0.0, min(x1, match_cell.x1) - max(x0, match_cell.x0))
+                width = max(x1 - x0, 1.0)
+                if overlap / width >= 0.4:
+                    picked.append((x0, y0, x1, y1))
+        fallback_words_count = len(picked)
+        if picked:
+            x0_min = min(r[0] for r in picked) - 2
+            y0_min = min(r[1] for r in picked) - 2
+            x1_max = max(r[2] for r in picked) + 2
+            y1_max = max(r[3] for r in picked) + 2
+            value_cell = fitz.Rect(x0_min, y0_min, x1_max, y1_max)
+            raw = get_cell_text(page, value_cell)
+            fallback_words_used = True
+            debug["raw_preview"] = (raw or "")[:80]
+
+    debug.update({
+        "fallback_words_used": fallback_words_used,
+        "fallback_words_count": fallback_words_count,
+        "value_cell_after_fallback": value_cell if fallback_words_used else None,
+        "value_cell": value_cell,
+        "raw": raw,
+    })
+
     normed = normalize_cell_text(raw)
-    debug.update({"value_cell": value_cell, "raw": raw, "norm": normed})
+    debug["norm"] = normed
     if not normed:
         debug["error"] = "adjacent_cell_empty"
         return None, debug
