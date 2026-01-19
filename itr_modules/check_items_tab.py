@@ -15,6 +15,9 @@ import fitz
 from itr_modules.shared.paths import OUTPUT_ROOT, ensure_output_dir, get_batch_id, open_in_file_explorer
 from itr_modules.shared.pdf_utils import (
     detect_checkitems_table,
+    extract_rulings,
+    find_cell_by_exact_norm,
+    get_cell_text_cached,
     norm_text,
     parse_pages_per_itr_regex,
     row_band_from_ys,
@@ -23,6 +26,7 @@ from itr_modules.shared.pdf_utils import (
 MODULE_NAME = "check_items"
 DEFAULT_PAGE1_REGEX = r"Page\s*1\s*of\s*(\d+)"
 DEFAULT_TAG_REGEX = r"TAG\s*NO\.\s*:\s*([A-Za-z0-9\-\._/]+)"
+TAG_DIRECTIONS = ["AUTO", "RIGHT", "DOWN"]
 
 
 def _parse_norm_list(text: str) -> list[str]:
@@ -36,6 +40,45 @@ def _safe_int(text: str) -> int | None:
         return None
 
 
+def _unique_sorted(vals: list[float], tol: float = 0.6) -> list[float]:
+    vals = sorted(vals)
+    out = []
+    for v in vals:
+        if not out or abs(v - out[-1]) > tol:
+            out.append(v)
+    return out
+
+
+def _build_word_buckets(words: list[tuple], bucket_size: float = 8.0) -> dict[int, list[tuple]]:
+    buckets: dict[int, list[tuple]] = {}
+    if bucket_size <= 0:
+        bucket_size = 8.0
+    for w in words:
+        y0 = w[1]
+        y1 = w[3]
+        b0 = int(y0 // bucket_size)
+        b1 = int(y1 // bucket_size)
+        for b in range(b0, b1 + 1):
+            buckets.setdefault(b, []).append(w)
+    return buckets
+
+
+def _row_index_from_ys(ys: list[float], y_center: float) -> int:
+    for i in range(len(ys) - 1):
+        if ys[i] - 1 <= y_center <= ys[i + 1] + 1:
+            return i
+    return -1
+
+
+def _col_bounds_from_xs(xs: list[float], x_center: float) -> tuple[int, float, float] | None:
+    if not xs or len(xs) < 2:
+        return None
+    for i in range(len(xs) - 1):
+        if xs[i] - 1 <= x_center <= xs[i + 1] + 1:
+            return i, xs[i], xs[i + 1]
+    return None
+
+
 class CheckItemsTestTab(ttk.Frame):
     def __init__(self, master):
         super().__init__(master)
@@ -47,6 +90,7 @@ class CheckItemsTestTab(ttk.Frame):
         self.pages_per_itr_var = tk.StringVar(value="")
         self.matchkey_name_var = tk.StringVar(value="TAG")
         self.tag_regex_var = tk.StringVar(value=DEFAULT_TAG_REGEX)
+        self.tag_dir_var = tk.StringVar(value="AUTO")
 
         self._worker_thread: threading.Thread | None = None
         self._q: "queue.Queue[tuple]" = queue.Queue()
@@ -96,13 +140,18 @@ class CheckItemsTestTab(ttk.Frame):
         )
 
         ttk.Label(cfg, text="MatchKey 名称：").grid(row=2, column=2, sticky="e", pady=(8, 0))
-        ttk.Entry(cfg, textvariable=self.matchkey_name_var, width=40).grid(
+        ttk.Entry(cfg, textvariable=self.matchkey_name_var, width=20).grid(
             row=2, column=3, sticky="we", padx=6, pady=(8, 0)
         )
 
         ttk.Label(cfg, text="Tag 正则：").grid(row=3, column=0, sticky="e", pady=(8, 0))
         ttk.Entry(cfg, textvariable=self.tag_regex_var, width=40).grid(
             row=3, column=1, columnspan=3, sticky="we", padx=6, pady=(8, 0)
+        )
+
+        ttk.Label(cfg, text="Tag 值方向：").grid(row=2, column=4, sticky="e", pady=(8, 0))
+        ttk.OptionMenu(cfg, self.tag_dir_var, self.tag_dir_var.get(), *TAG_DIRECTIONS).grid(
+            row=2, column=5, sticky="w", padx=6, pady=(8, 0)
         )
 
         cfg.columnconfigure(1, weight=1)
@@ -307,20 +356,58 @@ class CheckItemsTestTab(ttk.Frame):
 
         return []
 
-    def _extract_tag_from_segment(self, doc: fitz.Document, segment: tuple[int, int], tag_regex: str) -> str:
-        try:
-            rx = re.compile(tag_regex, re.IGNORECASE)
-        except re.error:
-            rx = re.compile(DEFAULT_TAG_REGEX, re.IGNORECASE)
-            self._log("[解析] Tag 正则非法，已回退默认规则。")
+    def _find_tag_cells(
+        self,
+        page: fitz.Page,
+        matchkey_norm: str,
+        tag_regex: str,
+        direction: str,
+    ) -> tuple[fitz.Rect | None, fitz.Rect | None, str]:
+        words = page.get_text("words") or []
+        buckets = _build_word_buckets(words)
+        cache: dict[tuple[float, float, float, float], str] = {}
+        verticals, horizontals = extract_rulings(page)
+        xs = _unique_sorted([x for x, _, _ in verticals])
+        ys = _unique_sorted([y for y, _, _ in horizontals])
 
-        start, end = segment
-        for page_index in range(start, min(end + 1, start + 2)):
-            text = doc[page_index].get_text("text") or ""
-            m = rx.search(text)
-            if m:
-                return m.group(1).strip()
-        return ""
+        match_cell = find_cell_by_exact_norm(
+            page,
+            matchkey_norm,
+            verticals,
+            horizontals,
+            search_clip=None,
+            words=words,
+            buckets=buckets,
+            cache=cache,
+        )
+        if not match_cell:
+            return None, None, ""
+
+        y_idx = _row_index_from_ys(ys, (match_cell.y0 + match_cell.y1) / 2.0)
+        row_band = row_band_from_ys(y_idx, ys) if y_idx >= 0 else None
+        col_info = _col_bounds_from_xs(xs, (match_cell.x0 + match_cell.x1) / 2.0)
+        if not row_band or not col_info:
+            return match_cell, None, ""
+
+        col_idx, x0, x1 = col_info
+        value_cell = None
+        if direction in ("AUTO", "RIGHT") and col_idx + 2 < len(xs):
+            value_cell = fitz.Rect(xs[col_idx + 1], row_band[0], xs[col_idx + 2], row_band[1])
+        if direction == "DOWN" or (direction == "AUTO" and value_cell is None):
+            if y_idx + 2 < len(ys):
+                value_cell = fitz.Rect(x0, ys[y_idx + 1], x1, ys[y_idx + 2])
+
+        tag_value = ""
+        if value_cell:
+            raw = get_cell_text_cached(value_cell, words, buckets, cache)
+            try:
+                rx = re.compile(tag_regex, re.IGNORECASE)
+            except re.error:
+                rx = re.compile(DEFAULT_TAG_REGEX, re.IGNORECASE)
+            match = rx.search(raw)
+            tag_value = match.group(1).strip() if match else raw.strip()
+
+        return match_cell, value_cell, tag_value
 
     def _detect_table_info(self, doc: fitz.Document, segment: tuple[int, int]) -> tuple[int, dict]:
         header_norms = _parse_norm_list(self.header_norms_var.get())
@@ -342,6 +429,8 @@ class CheckItemsTestTab(ttk.Frame):
         pages_per_itr_manual = _safe_int(self.pages_per_itr_var.get().strip())
         tag_regex = self.tag_regex_var.get().strip() or DEFAULT_TAG_REGEX
         matchkey_name = self.matchkey_name_var.get().strip() or "TAG"
+        matchkey_norm = norm_text(matchkey_name)
+        direction = (self.tag_dir_var.get() or "AUTO").upper()
 
         self.parsed_tags = {}
         unknown_idx = 1
@@ -373,12 +462,24 @@ class CheckItemsTestTab(ttk.Frame):
                 continue
 
             for itr_idx, segment in enumerate(segments, start=1):
-                tag_id = self._extract_tag_from_segment(doc, segment, tag_regex)
-                if not tag_id:
-                    tag_id = f"UNKNOWN-{unknown_idx}"
+                tag_value = ""
+                match_cell = None
+                value_cell = None
+                for page_index in range(segment[0], min(segment[1] + 1, segment[0] + 2)):
+                    match_cell, value_cell, tag_value = self._find_tag_cells(
+                        doc[page_index],
+                        matchkey_norm,
+                        tag_regex,
+                        direction,
+                    )
+                    if tag_value:
+                        break
+
+                if not tag_value:
+                    tag_value = f"UNKNOWN-{unknown_idx}"
                     unknown_idx += 1
                     self._log(
-                        f"[解析] {Path(pdf_path).name} 第{itr_idx}套未找到{matchkey_name}，使用 {tag_id}"
+                        f"[解析] {Path(pdf_path).name} 第{itr_idx}套未找到{matchkey_name}，使用 {tag_value}"
                     )
 
                 item_count, table_info = self._detect_table_info(doc, segment)
@@ -392,8 +493,10 @@ class CheckItemsTestTab(ttk.Frame):
                     "item_count": item_count,
                     "table_info": table_info,
                     "header_texts": table_info.get("header_texts", {}) if table_info else {},
+                    "tag_match_cell": match_cell,
+                    "tag_value_cell": value_cell,
                 }
-                self.parsed_tags.setdefault(tag_id, []).append(entry)
+                self.parsed_tags.setdefault(tag_value, []).append(entry)
 
             doc.close()
 
@@ -500,6 +603,7 @@ class CheckItemsTestTab(ttk.Frame):
                 state_norms,
                 self.matchkey_name_var.get().strip() or "TAG",
                 self.tag_regex_var.get().strip() or DEFAULT_TAG_REGEX,
+                (self.tag_dir_var.get() or "AUTO").upper(),
                 out_dir,
             ),
             daemon=True,
@@ -524,21 +628,12 @@ class CheckItemsTestTab(ttk.Frame):
         if self._worker_thread and self._worker_thread.is_alive():
             self.after(120, self._poll_queue)
 
-    def _draw_tag_boxes(self, page: fitz.Page, matchkey_name: str, tag_regex: str) -> None:
-        if matchkey_name:
-            for rect in page.search_for(matchkey_name):
-                page.draw_rect(rect, color=(0, 0.6, 0), width=1.2)
-        try:
-            rx = re.compile(tag_regex, re.IGNORECASE)
-        except re.error:
-            rx = re.compile(DEFAULT_TAG_REGEX, re.IGNORECASE)
-        text = page.get_text("text") or ""
-        match = rx.search(text)
-        if match:
-            value = match.group(1).strip()
-            if value:
-                for rect in page.search_for(value):
-                    page.draw_rect(rect, color=(0, 0.6, 0), width=1.2)
+    def _draw_tag_boxes(self, page: fitz.Page, matchkey_name: str, tag_regex: str, direction: str) -> None:
+        match_cell, value_cell, _ = self._find_tag_cells(page, norm_text(matchkey_name), tag_regex, direction)
+        if match_cell:
+            page.draw_rect(match_cell, color=(0, 0.6, 0), width=1.2)
+        if value_cell:
+            page.draw_rect(value_cell, color=(0, 0.6, 0), width=1.2)
 
     def _test_worker(
         self,
@@ -548,6 +643,7 @@ class CheckItemsTestTab(ttk.Frame):
         state_norms: list[str],
         matchkey_name: str,
         tag_regex: str,
+        direction: str,
         out_dir: Path,
     ):
         for pdf_path in targets:
@@ -562,30 +658,10 @@ class CheckItemsTestTab(ttk.Frame):
                 ys = info.get("grid_ys", [])
                 numbered_rows = info.get("numbered_rows", [])
                 state_bounds = info.get("state_bounds", {})
-                xs = info.get("grid_xs", [])
-
-                def _col_bounds(rect: fitz.Rect | None) -> tuple[float, float] | None:
-                    if not rect or not xs or len(xs) < 2:
-                        return None
-                    cx = (rect.x0 + rect.x1) / 2.0
-                    left = None
-                    right = None
-                    for x in xs:
-                        if x <= cx:
-                            left = x
-                        if x >= cx and right is None:
-                            right = x
-                    if left is None or right is None:
-                        return None
-                    if left == right:
-                        for i in range(len(xs) - 1):
-                            if xs[i] <= cx <= xs[i + 1]:
-                                return xs[i], xs[i + 1]
-                        return None
-                    return left, right
 
                 if not (index_bounds and ys and numbered_rows):
-                    self._draw_tag_boxes(page, matchkey_name, tag_regex)
+                    self._log("[Test] 表格识别失败，跳过该页框选。")
+                    self._draw_tag_boxes(page, matchkey_name, tag_regex, direction)
                     continue
 
                 for rect in header_cells.values():
@@ -597,19 +673,6 @@ class CheckItemsTestTab(ttk.Frame):
                         continue
                     y0, y1 = band
                     page.draw_rect(fitz.Rect(index_bounds[0], y0, index_bounds[1], y1), color=(0, 0, 1), width=1.2)
-
-                desc_bounds = _col_bounds(header_cells.get("DESCRIPTION"))
-                if desc_bounds:
-                    for row_idx in numbered_rows:
-                        band = row_band_from_ys(row_idx, ys)
-                        if not band:
-                            continue
-                        y0, y1 = band
-                        page.draw_rect(
-                            fitz.Rect(desc_bounds[0], y0, desc_bounds[1], y1),
-                            color=(0, 0, 1),
-                            width=1.2,
-                        )
 
                 for state_norm in state_norms:
                     state_bounds_rect = state_bounds.get(state_norm)
@@ -626,7 +689,7 @@ class CheckItemsTestTab(ttk.Frame):
                             width=1.2,
                         )
 
-                self._draw_tag_boxes(page, matchkey_name, tag_regex)
+                self._draw_tag_boxes(page, matchkey_name, tag_regex, direction)
 
             doc.save(out_pdf)
             doc.close()
