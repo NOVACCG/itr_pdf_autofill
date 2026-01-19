@@ -36,7 +36,7 @@ APP_VERSION = "V1.0.3"
 
 from itr_modules.shared.paths import BASE_DIR, ensure_output_dir, ensure_report_dir, get_batch_id, open_in_file_explorer
 from itr_modules.shared.pdf_utils import (
-    extract_tag_by_cell_adjacency,
+    extract_tag_by_cell_adjacency_candidates,
     extract_tag_candidates_from_text,
     fit_text_to_box,
     norm_text,
@@ -801,6 +801,12 @@ class ITRAutofillTab(ttk.Frame):
         win.title("预设管理")
         win.geometry("1380x860")
         win.withdraw()
+        root = self.winfo_toplevel()
+        win.transient(root)
+        win.lift()
+        win.attributes("-topmost", True)
+        win.after(200, lambda: win.attributes("-topmost", False))
+        win.focus_force()
 
         def on_close():
             win.withdraw()
@@ -1650,17 +1656,30 @@ class ITRAutofillTab(ttk.Frame):
         if cached and cached.get("value"):
             return cached["value"], cached.get("source", "regex_manual")
         key_name = match_cfg.get("key_name", "TAG")
-        matchkey_norm = norm_text(key_name)
+        candidates = match_cfg.get("excel_key_col_candidates_norm", []) or []
+        candidates = [c.strip() for c in candidates if str(c).strip()]
         direction = (match_cfg.get("tag_direction", "RIGHT") or "RIGHT").upper()
         page1 = doc[start_page - 1]
 
         if tag_mode == TAG_MODE_CELL:
-            tag_value, debug = extract_tag_by_cell_adjacency(page1, matchkey_norm, direction)
+            print(f"Key 名称={key_name}（仅显示用，不参与定位）")
+            print(f"方法A：使用 candidates={candidates} 定位 matchkey 单元格")
+            tag_value, debug = extract_tag_by_cell_adjacency_candidates(page1, candidates, direction)
+            if debug.get("matched_candidate"):
+                print(
+                    f"命中 matchkey 候选={debug.get('matched_candidate')}, "
+                    f"cell_norm={debug.get('cell_norm')}, cell_rect={debug.get('cell_rect')}"
+                )
             if tag_value:
+                tag_value = norm_key_value(tag_value)
+                for suf in match_cfg.get("strip_suffixes", []):
+                    suf_up = norm_key_value(suf)
+                    if suf_up and tag_value.endswith(suf_up):
+                        tag_value = tag_value[: -len(suf_up)]
                 self.tag_choice_cache[cache_key] = {"value": tag_value, "source": "cell_adjacency"}
                 return tag_value, "cell_adjacency"
             if debug.get("error") == "match_cell_not_found":
-                print(f"未找到 matchkey={key_name} 的单元格（严格等值匹配）")
+                print("未找到任何 matchkey 候选（严格/endswith 匹配）")
             else:
                 print(f"找到 matchkey 单元格，但 direction={direction} 的相邻单元格为空/不存在")
             print("你可以切换到【正则】模式后重试")

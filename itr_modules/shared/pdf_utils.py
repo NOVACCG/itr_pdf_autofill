@@ -383,6 +383,105 @@ def extract_tag_by_cell_adjacency(
     return normed, debug
 
 
+def find_cell_by_candidates(
+    page: fitz.Page,
+    candidates: list[str],
+    verticals,
+    horizontals,
+    search_clip: fitz.Rect | None = None,
+) -> tuple[fitz.Rect | None, dict]:
+    cand_norms = [norm_text(c) for c in candidates if norm_text(c)]
+    debug = {"candidates": cand_norms}
+    if not cand_norms:
+        debug["error"] = "candidates_empty"
+        return None, debug
+
+    words = page.get_text("words", clip=search_clip) if search_clip else page.get_text("words")
+    hits = []
+    for x0, y0, x1, y1, w, *_ in words:
+        wn = norm_text(w)
+        if not wn:
+            continue
+        if not any((wn == cand or cand in wn or wn in cand) for cand in cand_norms):
+            continue
+        cell = cell_rect_for_word(fitz.Rect(x0, y0, x1, y1), verticals, horizontals)
+        if not cell:
+            continue
+        cell_norm = norm_text(get_cell_text(page, cell))
+        matched = None
+        for cand in cand_norms:
+            if cell_norm == cand or cell_norm.endswith(cand):
+                matched = cand
+                break
+        if matched:
+            hits.append((cell, matched, cell_norm))
+
+    if not hits:
+        debug["error"] = "match_cell_not_found"
+        return None, debug
+
+    hits.sort(key=lambda item: (item[0].y0, item[0].x0))
+    cell, matched, cell_norm = hits[0]
+    debug.update({"matched_candidate": matched, "cell_norm": cell_norm, "cell_rect": cell})
+    return cell, debug
+
+
+def extract_tag_by_cell_adjacency_candidates(
+    page: fitz.Page,
+    candidates: list[str],
+    direction: str,
+) -> tuple[str | None, dict]:
+    verticals, horizontals = extract_rulings(page)
+    match_cell, debug = find_cell_by_candidates(page, candidates, verticals, horizontals)
+    if not match_cell:
+        return None, debug
+
+    xs = _unique_sorted_x_from_verticals(verticals)
+    ys = _uniq_sorted([y for y, _, _ in horizontals])
+    if len(xs) < 2 or len(ys) < 2:
+        debug["error"] = "grid_not_found"
+        return None, debug
+
+    cx = (match_cell.x0 + match_cell.x1) / 2.0
+    cy = (match_cell.y0 + match_cell.y1) / 2.0
+    col_idx = None
+    for i in range(len(xs) - 1):
+        if xs[i] - 1 <= cx <= xs[i + 1] + 1:
+            col_idx = i
+            break
+    row_idx = row_index_from_ys(ys, cy)
+    if col_idx is None or row_idx < 0:
+        debug["error"] = "cell_index_not_found"
+        return None, debug
+
+    direction = (direction or "RIGHT").upper()
+    value_cell = None
+    if direction == "DOWN":
+        if row_idx + 2 < len(ys):
+            value_cell = fitz.Rect(xs[col_idx], ys[row_idx + 1], xs[col_idx + 1], ys[row_idx + 2])
+    elif direction == "UP":
+        if row_idx - 1 >= 0:
+            value_cell = fitz.Rect(xs[col_idx], ys[row_idx - 1], xs[col_idx + 1], ys[row_idx])
+    elif direction == "LEFT":
+        if col_idx - 1 >= 0:
+            value_cell = fitz.Rect(xs[col_idx - 1], ys[row_idx], xs[col_idx], ys[row_idx + 1])
+    else:
+        if col_idx + 2 < len(xs):
+            value_cell = fitz.Rect(xs[col_idx + 1], ys[row_idx], xs[col_idx + 2], ys[row_idx + 1])
+
+    if not value_cell:
+        debug["error"] = "adjacent_cell_not_found"
+        return None, debug
+
+    raw = get_cell_text(page, value_cell)
+    normed = normalize_cell_text(raw)
+    debug.update({"value_cell": value_cell, "raw": raw, "norm": normed})
+    if not normed:
+        debug["error"] = "adjacent_cell_empty"
+        return None, debug
+    return normed, debug
+
+
 def _norm_join_words(words_in_row) -> str:
     """Join words in a row (PyMuPDF words tuples) from left to right."""
     if not words_in_row:
@@ -907,9 +1006,11 @@ __all__ = [
     "detect_checkitems_table",
     "draw_checkmark",
     "extract_tag_by_cell_adjacency",
+    "extract_tag_by_cell_adjacency_candidates",
     "extract_tag_candidates_from_text",
     "extract_tag_candidates_first_page",
     "fit_text_to_box",
+    "find_cell_by_candidates",
     "get_cell_text_cached",
     "is_valid_tag_value",
     "normalize_cell_text",
