@@ -293,14 +293,24 @@ def _cell_rect_from_point(
     horizontals: list[tuple[float, float, float]],
     tol: float = 1.5,
 ) -> fitz.Rect | None:
-    xs = [round(x, 1) for x, y0, y1 in verticals if y0 - tol <= mid_y <= y1 + tol]
-    ys = [round(y, 1) for y, x0, x1 in horizontals if x0 - tol <= mid_x <= x1 + tol]
+    xs = [x for x, y0, y1 in verticals if y0 - tol <= mid_y <= y1 + tol]
+    ys = [y for y, x0, x1 in horizontals if x0 - tol <= mid_x <= x1 + tol]
     if not xs or not ys:
         return None
-    lefts = [x for x in xs if x <= mid_x + 0.1]
-    rights = [x for x in xs if x >= mid_x - 0.1]
-    tops = [y for y in ys if y <= mid_y + 0.1]
-    bottoms = [y for y in ys if y >= mid_y - 0.1]
+    xs_sorted = sorted(xs)
+    ys_sorted = sorted(ys)
+    xs_deduped = []
+    for x in xs_sorted:
+        if not xs_deduped or abs(x - xs_deduped[-1]) > tol:
+            xs_deduped.append(x)
+    ys_deduped = []
+    for y in ys_sorted:
+        if not ys_deduped or abs(y - ys_deduped[-1]) > tol:
+            ys_deduped.append(y)
+    lefts = [x for x in xs_deduped if x <= mid_x + tol]
+    rights = [x for x in xs_deduped if x >= mid_x - tol]
+    tops = [y for y in ys_deduped if y <= mid_y + tol]
+    bottoms = [y for y in ys_deduped if y >= mid_y - tol]
     if not lefts or not rights or not tops or not bottoms:
         return None
     x0 = max(lefts)
@@ -418,16 +428,24 @@ def extract_tag_by_cell_adjacency(
 
     verticals, horizontals = extract_rulings(page)
     key_left, key_top, key_right, key_bottom = key_cell.x0, key_cell.y0, key_cell.x1, key_cell.y1
-    row_mid = (key_top + key_bottom) / 2.0
     col_mid = (key_left + key_right) / 2.0
-    xs = [round(x, 1) for x, y0, y1 in verticals if y0 - 1 <= row_mid <= y1 + 1]
-    ys = [round(y, 1) for y, x0, x1 in horizontals if x0 - 1 <= col_mid <= x1 + 1]
+    line_eps = 1.5
+    xs = [x for x, y0, y1 in verticals if y0 <= key_top + line_eps and y1 >= key_bottom - line_eps]
+    ys = [y for y, x0, x1 in horizontals if x0 - 1 <= col_mid <= x1 + 1]
+    debug.update({
+        "xs_count": len(xs),
+        "key_top": key_top,
+        "key_bottom": key_bottom,
+        "line_eps": line_eps,
+    })
 
     direction = (direction or "RIGHT").upper()
     margin = 36
     value_cell = None
+    right_line_x = None
     if direction == "RIGHT":
-        right_x = min([x for x in xs if x > key_right + 0.5], default=page.rect.x1 - margin)
+        right_line_x = min([x for x in xs if x > key_right + line_eps], default=None)
+        right_x = right_line_x if right_line_x is not None else page.rect.x1 - margin
         value_cell = fitz.Rect(key_right, key_top, right_x, key_bottom)
     elif direction == "LEFT":
         left_x = max([x for x in xs if x < key_left - 0.5], default=page.rect.x0 + margin)
@@ -441,7 +459,8 @@ def extract_tag_by_cell_adjacency(
 
     debug["key_cell_rect"] = key_cell
     debug["value_cell_rect"] = value_cell
-    if value_cell.width <= 10 or value_cell.height <= 5:
+    debug["right_line_x"] = right_line_x
+    if value_cell.width <= 2 or value_cell.height <= 2:
         debug["error"] = "adjacent_cell_not_found"
         return None, debug
 
@@ -513,15 +532,23 @@ def extract_tag_by_cell_adjacency_candidates(
 
     verticals, horizontals = extract_rulings(page)
     key_left, key_top, key_right, key_bottom = key_cell.x0, key_cell.y0, key_cell.x1, key_cell.y1
-    row_mid = (key_top + key_bottom) / 2.0
     col_mid = (key_left + key_right) / 2.0
-    xs = [round(x, 1) for x, y0, y1 in verticals if y0 - 1 <= row_mid <= y1 + 1]
-    ys = [round(y, 1) for y, x0, x1 in horizontals if x0 - 1 <= col_mid <= x1 + 1]
+    line_eps = 1.5
+    xs = [x for x, y0, y1 in verticals if y0 <= key_top + line_eps and y1 >= key_bottom - line_eps]
+    ys = [y for y, x0, x1 in horizontals if x0 - 1 <= col_mid <= x1 + 1]
+    debug.update({
+        "xs_count": len(xs),
+        "key_top": key_top,
+        "key_bottom": key_bottom,
+        "line_eps": line_eps,
+    })
 
     direction = (direction or "RIGHT").upper()
     margin = 36
+    right_line_x = None
     if direction == "RIGHT":
-        right_x = min([x for x in xs if x > key_right + 0.5], default=page.rect.x1 - margin)
+        right_line_x = min([x for x in xs if x > key_right + line_eps], default=None)
+        right_x = right_line_x if right_line_x is not None else page.rect.x1 - margin
         value_cell = fitz.Rect(key_right, key_top, right_x, key_bottom)
     elif direction == "LEFT":
         left_x = max([x for x in xs if x < key_left - 0.5], default=page.rect.x0 + margin)
@@ -535,7 +562,8 @@ def extract_tag_by_cell_adjacency_candidates(
 
     debug["key_cell_rect"] = key_cell
     debug["value_cell_rect"] = value_cell
-    if value_cell.width <= 10 or value_cell.height <= 5:
+    debug["right_line_x"] = right_line_x
+    if value_cell.width <= 2 or value_cell.height <= 2:
         debug["error"] = "adjacent_cell_not_found"
         return None, debug
 
