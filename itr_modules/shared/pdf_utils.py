@@ -338,42 +338,64 @@ def extract_tag_by_cell_adjacency(
         debug["error"] = "match_cell_not_found"
         return None, debug
 
-    xs = _unique_sorted_x_from_verticals(verticals)
-    ys = _uniq_sorted([y for y, _, _ in horizontals])
-    if len(xs) < 2 or len(ys) < 2:
-        debug["error"] = "grid_not_found"
-        return None, debug
-
     cx = (match_cell.x0 + match_cell.x1) / 2.0
     cy = (match_cell.y0 + match_cell.y1) / 2.0
-    col_idx = None
-    for i in range(len(xs) - 1):
-        if xs[i] - 1 <= cx <= xs[i + 1] + 1:
-            col_idx = i
-            break
-    row_idx = row_index_from_ys(ys, cy)
-    if col_idx is None or row_idx < 0:
-        debug["error"] = "cell_index_not_found"
-        return None, debug
+    eps = 0.5
+    xs_row = _uniq_sorted([x for x, y0, y1 in verticals if y0 - eps <= cy <= y1 + eps])
+    ys_col = _uniq_sorted([y for y, x0, x1 in horizontals if x0 - eps <= cx <= x1 + eps])
+    debug["xs_row_len"] = len(xs_row)
+    debug["xs_row_head"] = xs_row[:6]
+    debug["ys_col_len"] = len(ys_col)
+    debug["ys_col_head"] = ys_col[:6]
+
+    y0 = max((y for y in ys_col if y <= cy), default=match_cell.y0)
+    y1 = min((y for y in ys_col if y >= cy), default=match_cell.y1)
+    if y1 <= y0:
+        y0, y1 = match_cell.y0, match_cell.y1
 
     direction = (direction or "RIGHT").upper()
     value_cell = None
-    if direction == "DOWN":
-        if row_idx + 2 < len(ys):
-            value_cell = fitz.Rect(xs[col_idx], ys[row_idx + 1], xs[col_idx + 1], ys[row_idx + 2])
-    elif direction == "UP":
-        if row_idx - 1 >= 0:
-            value_cell = fitz.Rect(xs[col_idx], ys[row_idx - 1], xs[col_idx + 1], ys[row_idx])
+    margin = 36
+    if direction == "RIGHT":
+        x0 = next((x for x in xs_row if x > match_cell.x1 + eps), None)
+        if x0 is None:
+            debug["error"] = "adjacent_cell_not_found"
+            return None, debug
+        x1 = next((x for x in xs_row if x > x0 + eps), None)
+        if x1 is None:
+            x1 = page.rect.x1 - margin
+        value_cell = fitz.Rect(x0, y0, x1, y1)
     elif direction == "LEFT":
-        if col_idx - 1 >= 0:
-            value_cell = fitz.Rect(xs[col_idx - 1], ys[row_idx], xs[col_idx], ys[row_idx + 1])
+        x1 = next((x for x in reversed(xs_row) if x < match_cell.x0 - eps), None)
+        if x1 is None:
+            debug["error"] = "adjacent_cell_not_found"
+            return None, debug
+        x0 = next((x for x in reversed(xs_row) if x < x1 - eps), None)
+        if x0 is None:
+            x0 = page.rect.x0 + margin
+        value_cell = fitz.Rect(x0, y0, x1, y1)
+    elif direction == "DOWN":
+        y0_down = next((y for y in ys_col if y > match_cell.y1 + eps), None)
+        if y0_down is None:
+            debug["error"] = "adjacent_cell_not_found"
+            return None, debug
+        y1_down = next((y for y in ys_col if y > y0_down + eps), None)
+        if y1_down is None:
+            y1_down = page.rect.y1 - margin
+        value_cell = fitz.Rect(match_cell.x0, y0_down, match_cell.x1, y1_down)
     else:
-        if col_idx + 2 < len(xs):
-            value_cell = fitz.Rect(xs[col_idx + 1], ys[row_idx], xs[col_idx + 2], ys[row_idx + 1])
+        y1_up = next((y for y in reversed(ys_col) if y < match_cell.y0 - eps), None)
+        if y1_up is None:
+            debug["error"] = "adjacent_cell_not_found"
+            return None, debug
+        y0_up = next((y for y in reversed(ys_col) if y < y1_up - eps), None)
+        if y0_up is None:
+            y0_up = page.rect.y0 + margin
+        value_cell = fitz.Rect(match_cell.x0, y0_up, match_cell.x1, y1_up)
 
-    if not value_cell:
-        debug["error"] = "adjacent_cell_not_found"
-        return None, debug
+    debug.update({"y0": y0, "y1": y1})
+    if value_cell:
+        debug.update({"x0": value_cell.x0, "x1": value_cell.x1})
 
     raw = get_cell_text(page, value_cell)
     normed = normalize_cell_text(raw)
@@ -437,42 +459,64 @@ def extract_tag_by_cell_adjacency_candidates(
     if not match_cell:
         return None, debug
 
-    xs = _unique_sorted_x_from_verticals(verticals)
-    ys = _uniq_sorted([y for y, _, _ in horizontals])
-    if len(xs) < 2 or len(ys) < 2:
-        debug["error"] = "grid_not_found"
-        return None, debug
-
     cx = (match_cell.x0 + match_cell.x1) / 2.0
     cy = (match_cell.y0 + match_cell.y1) / 2.0
-    col_idx = None
-    for i in range(len(xs) - 1):
-        if xs[i] - 1 <= cx <= xs[i + 1] + 1:
-            col_idx = i
-            break
-    row_idx = row_index_from_ys(ys, cy)
-    if col_idx is None or row_idx < 0:
-        debug["error"] = "cell_index_not_found"
-        return None, debug
+    eps = 0.5
+    xs_row = _uniq_sorted([x for x, y0, y1 in verticals if y0 - eps <= cy <= y1 + eps])
+    ys_col = _uniq_sorted([y for y, x0, x1 in horizontals if x0 - eps <= cx <= x1 + eps])
+    debug["xs_row_len"] = len(xs_row)
+    debug["xs_row_head"] = xs_row[:6]
+    debug["ys_col_len"] = len(ys_col)
+    debug["ys_col_head"] = ys_col[:6]
+
+    y0 = max((y for y in ys_col if y <= cy), default=match_cell.y0)
+    y1 = min((y for y in ys_col if y >= cy), default=match_cell.y1)
+    if y1 <= y0:
+        y0, y1 = match_cell.y0, match_cell.y1
 
     direction = (direction or "RIGHT").upper()
     value_cell = None
-    if direction == "DOWN":
-        if row_idx + 2 < len(ys):
-            value_cell = fitz.Rect(xs[col_idx], ys[row_idx + 1], xs[col_idx + 1], ys[row_idx + 2])
-    elif direction == "UP":
-        if row_idx - 1 >= 0:
-            value_cell = fitz.Rect(xs[col_idx], ys[row_idx - 1], xs[col_idx + 1], ys[row_idx])
+    margin = 36
+    if direction == "RIGHT":
+        x0 = next((x for x in xs_row if x > match_cell.x1 + eps), None)
+        if x0 is None:
+            debug["error"] = "adjacent_cell_not_found"
+            return None, debug
+        x1 = next((x for x in xs_row if x > x0 + eps), None)
+        if x1 is None:
+            x1 = page.rect.x1 - margin
+        value_cell = fitz.Rect(x0, y0, x1, y1)
     elif direction == "LEFT":
-        if col_idx - 1 >= 0:
-            value_cell = fitz.Rect(xs[col_idx - 1], ys[row_idx], xs[col_idx], ys[row_idx + 1])
+        x1 = next((x for x in reversed(xs_row) if x < match_cell.x0 - eps), None)
+        if x1 is None:
+            debug["error"] = "adjacent_cell_not_found"
+            return None, debug
+        x0 = next((x for x in reversed(xs_row) if x < x1 - eps), None)
+        if x0 is None:
+            x0 = page.rect.x0 + margin
+        value_cell = fitz.Rect(x0, y0, x1, y1)
+    elif direction == "DOWN":
+        y0_down = next((y for y in ys_col if y > match_cell.y1 + eps), None)
+        if y0_down is None:
+            debug["error"] = "adjacent_cell_not_found"
+            return None, debug
+        y1_down = next((y for y in ys_col if y > y0_down + eps), None)
+        if y1_down is None:
+            y1_down = page.rect.y1 - margin
+        value_cell = fitz.Rect(match_cell.x0, y0_down, match_cell.x1, y1_down)
     else:
-        if col_idx + 2 < len(xs):
-            value_cell = fitz.Rect(xs[col_idx + 1], ys[row_idx], xs[col_idx + 2], ys[row_idx + 1])
+        y1_up = next((y for y in reversed(ys_col) if y < match_cell.y0 - eps), None)
+        if y1_up is None:
+            debug["error"] = "adjacent_cell_not_found"
+            return None, debug
+        y0_up = next((y for y in reversed(ys_col) if y < y1_up - eps), None)
+        if y0_up is None:
+            y0_up = page.rect.y0 + margin
+        value_cell = fitz.Rect(match_cell.x0, y0_up, match_cell.x1, y1_up)
 
-    if not value_cell:
-        debug["error"] = "adjacent_cell_not_found"
-        return None, debug
+    debug.update({"y0": y0, "y1": y1})
+    if value_cell:
+        debug.update({"x0": value_cell.x0, "x1": value_cell.x1})
 
     raw = get_cell_text(page, value_cell)
     normed = normalize_cell_text(raw)
