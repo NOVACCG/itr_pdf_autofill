@@ -419,44 +419,52 @@ def build_covering_horizontals(
 
 
 def find_adjacent_cell_by_lines(
+    page: fitz.Page,
     key_cell: fitz.Rect,
     direction: str,
-    vcover: list[float],
-    hcover: list[float],
     eps: float = 0.25,
+    cover: float = 0.8,
     pad: float = 0.4,
 ) -> tuple[fitz.Rect | None, dict]:
     kx0, ky0, kx1, ky1 = key_cell
     direction = (direction or "RIGHT").upper()
-    debug: dict = {"direction": direction}
+    vcover = build_covering_verticals(page, key_cell, eps=eps, cover=cover)
+    hcover = build_covering_horizontals(page, key_cell, eps=eps, cover=cover)
+    debug: dict = {
+        "direction": direction,
+        "vcover_count": len(vcover),
+        "hcover_count": len(hcover),
+    }
+    chosen_line = None
     if direction == "RIGHT":
-        right_line = min([x for x in vcover if x > kx1 + eps], default=None)
-        debug["chosen_right_line"] = right_line
-        if right_line is None:
+        chosen_line = min([x for x in vcover if x > kx1 + eps], default=None)
+        if chosen_line is None:
             debug["error"] = "adjacent_cell_not_found"
+            debug["chosen_line"] = None
             return None, debug
-        rect = fitz.Rect(kx1, ky0, right_line, ky1)
+        rect = fitz.Rect(kx1, ky0, chosen_line, ky1)
     elif direction == "LEFT":
-        left_line = max([x for x in vcover if x < kx0 - eps], default=None)
-        debug["chosen_left_line"] = left_line
-        if left_line is None:
+        chosen_line = max([x for x in vcover if x < kx0 - eps], default=None)
+        if chosen_line is None:
             debug["error"] = "adjacent_cell_not_found"
+            debug["chosen_line"] = None
             return None, debug
-        rect = fitz.Rect(left_line, ky0, kx0, ky1)
+        rect = fitz.Rect(chosen_line, ky0, kx0, ky1)
     elif direction == "DOWN":
-        down_line = min([y for y in hcover if y > ky1 + eps], default=None)
-        debug["chosen_down_line"] = down_line
-        if down_line is None:
+        chosen_line = min([y for y in hcover if y > ky1 + eps], default=None)
+        if chosen_line is None:
             debug["error"] = "adjacent_cell_not_found"
+            debug["chosen_line"] = None
             return None, debug
-        rect = fitz.Rect(kx0, ky1, kx1, down_line)
+        rect = fitz.Rect(kx0, ky1, kx1, chosen_line)
     else:
-        up_line = max([y for y in hcover if y < ky0 - eps], default=None)
-        debug["chosen_up_line"] = up_line
-        if up_line is None:
+        chosen_line = max([y for y in hcover if y < ky0 - eps], default=None)
+        if chosen_line is None:
             debug["error"] = "adjacent_cell_not_found"
+            debug["chosen_line"] = None
             return None, debug
-        rect = fitz.Rect(kx0, up_line, kx1, ky0)
+        rect = fitz.Rect(kx0, chosen_line, kx1, ky0)
+    debug["chosen_line"] = chosen_line
     pad = min(max(pad, 0.0), 0.8)
     rect = fitz.Rect(rect.x0 + pad, rect.y0 + pad, rect.x1 - pad, rect.y1 - pad)
     return rect, debug
@@ -506,32 +514,20 @@ def extract_tag_by_cell_adjacency(
     page: fitz.Page,
     matchkey_norm: str,
     direction: str,
+    value_regex: str,
 ) -> tuple[str | None, dict]:
     key_cell, key_debug = find_anchor_cell_strict(page, [matchkey_norm])
     debug = {"direction": direction}
     debug.update(key_debug)
     if not key_cell:
-        debug["error"] = "match_cell_not_found"
+        debug["error"] = "anchor_cell_not_found"
         return None, debug
 
-    eps = 0.25
-    cover = 0.8
-    vcover = build_covering_verticals(page, key_cell, eps=eps, cover=cover)
-    hcover = build_covering_horizontals(page, key_cell, eps=eps, cover=cover)
     debug.update({
         "key_cell_rect": key_cell,
         "key_cell_text_norm": key_debug.get("key_cell_text_norm", ""),
-        "vcover_count": len(vcover),
-        "hcover_count": len(hcover),
     })
-    value_cell, adj_debug = find_adjacent_cell_by_lines(
-        key_cell,
-        direction,
-        vcover,
-        hcover,
-        eps=eps,
-        pad=0.4,
-    )
+    value_cell, adj_debug = find_adjacent_cell_by_lines(page, key_cell, direction, eps=0.25, cover=0.8, pad=0.4)
     debug.update(adj_debug)
     if not value_cell:
         debug["error"] = "adjacent_cell_not_found"
@@ -544,12 +540,21 @@ def extract_tag_by_cell_adjacency(
     raw = get_cell_text(page, value_cell)
     debug["value_cell_text_raw"] = raw
     debug["value_cell_text_raw_preview"] = (raw or "")[:200]
-    normed = normalize_cell_text(raw)
-    debug["value_cell_text_normed"] = normed
-    if not normed:
+    normalized_raw = normalize_cell_text(raw)
+    debug["value_cell_text_normed"] = normalized_raw
+    if not normalized_raw:
         debug["error"] = "adjacent_cell_empty"
         return None, debug
-    return normed, debug
+    try:
+        extracted = extract_value_by_regex(normalized_raw, value_regex)
+    except re.error:
+        debug["error"] = "regex_no_match"
+        return None, debug
+    extracted = normalize_cell_text(extracted)
+    if not extracted:
+        debug["error"] = "regex_no_match"
+        return None, debug
+    return extracted, debug
 
 
 def find_cell_by_candidates(
@@ -599,32 +604,20 @@ def extract_tag_by_cell_adjacency_candidates(
     page: fitz.Page,
     candidates: list[str],
     direction: str,
+    value_regex: str,
 ) -> tuple[str | None, dict]:
     key_cell, key_debug = find_anchor_cell_strict(page, candidates)
     debug = {"direction": direction}
     debug.update(key_debug)
     if not key_cell:
-        debug["error"] = "match_cell_not_found"
+        debug["error"] = "anchor_cell_not_found"
         return None, debug
 
-    eps = 0.25
-    cover = 0.8
-    vcover = build_covering_verticals(page, key_cell, eps=eps, cover=cover)
-    hcover = build_covering_horizontals(page, key_cell, eps=eps, cover=cover)
     debug.update({
         "key_cell_rect": key_cell,
         "key_cell_text_norm": key_debug.get("key_cell_text_norm", ""),
-        "vcover_count": len(vcover),
-        "hcover_count": len(hcover),
     })
-    value_cell, adj_debug = find_adjacent_cell_by_lines(
-        key_cell,
-        direction,
-        vcover,
-        hcover,
-        eps=eps,
-        pad=0.4,
-    )
+    value_cell, adj_debug = find_adjacent_cell_by_lines(page, key_cell, direction, eps=0.25, cover=0.8, pad=0.4)
     debug.update(adj_debug)
     if not value_cell:
         debug["error"] = "adjacent_cell_not_found"
@@ -637,12 +630,21 @@ def extract_tag_by_cell_adjacency_candidates(
     raw = get_cell_text(page, value_cell)
     debug["value_cell_text_raw"] = raw
     debug["value_cell_text_raw_preview"] = (raw or "")[:200]
-    normed = normalize_cell_text(raw)
-    debug["value_cell_text_normed"] = normed
-    if not normed:
+    normalized_raw = normalize_cell_text(raw)
+    debug["value_cell_text_normed"] = normalized_raw
+    if not normalized_raw:
         debug["error"] = "adjacent_cell_empty"
         return None, debug
-    return normed, debug
+    try:
+        extracted = extract_value_by_regex(normalized_raw, value_regex)
+    except re.error:
+        debug["error"] = "regex_no_match"
+        return None, debug
+    extracted = normalize_cell_text(extracted)
+    if not extracted:
+        debug["error"] = "regex_no_match"
+        return None, debug
+    return extracted, debug
 
 
 def find_adjacent_cell_with_tolerance(

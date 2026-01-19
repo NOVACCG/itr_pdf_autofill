@@ -36,7 +36,6 @@ APP_VERSION = "V1.0.3"
 
 from itr_modules.shared.paths import BASE_DIR, ensure_output_dir, ensure_report_dir, get_batch_id, open_in_file_explorer
 from itr_modules.shared.pdf_utils import (
-    extract_candidates_in_cell_text,
     extract_tag_by_cell_adjacency,
     fit_text_to_box,
     norm_text,
@@ -658,7 +657,8 @@ def pdf_position_test(pdf_path: str, preset: dict, fields: List[dict]) -> Tuple[
     key_norm = norm_text(match_cfg.get("key_name", "TAG"))
     tag_direction = (match_cfg.get("tag_direction", "RIGHT") or "RIGHT").upper()
     page = doc[set_start - 1]
-    tag_text, tag_debug = extract_tag_by_cell_adjacency(page, key_norm, tag_direction)
+    value_regex = (match_cfg.get("pdf_extract_regex", "") or "").strip() or DEFAULT_VALUE_REGEX
+    tag_text, tag_debug = extract_tag_by_cell_adjacency(page, key_norm, tag_direction, value_regex)
     key_cell_rect = tag_debug.get("key_cell_rect")
     value_cell_rect = tag_debug.get("value_cell_rect")
     if key_cell_rect:
@@ -666,19 +666,17 @@ def pdf_position_test(pdf_path: str, preset: dict, fields: List[dict]) -> Tuple[
     if value_cell_rect:
         page.draw_rect(value_cell_rect, color=(1, 0, 0), width=1.2)
     value_raw_preview = (tag_debug.get("value_cell_text_raw") or "")[:200]
-    value_regex = (match_cfg.get("pdf_extract_regex", "") or "").strip() or DEFAULT_VALUE_REGEX
-    try:
-        candidates = extract_candidates_in_cell_text(
-            normalize_cell_text(tag_debug.get("value_cell_text_raw") or ""), value_regex
-        )
-    except re.error:
-        candidates = []
+    chosen_line = tag_debug.get("chosen_line")
+    vcover_count = tag_debug.get("vcover_count")
+    hcover_count = tag_debug.get("hcover_count")
+    error = tag_debug.get("error", "")
     logs.append(
         f"TAG pdf={os.path.basename(pdf_path)} start_page=P1 anchor_norm={key_norm} "
         f"key_cell_rect={key_cell_rect} key_cell_text_raw=\"{tag_debug.get('key_cell_text_raw', '')}\" "
         f"key_cell_text_norm=\"{tag_debug.get('key_cell_text_norm', '')}\" direction={tag_direction} "
+        f"vcover_count={vcover_count} hcover_count={hcover_count} chosen_line={chosen_line} "
         f"value_cell_rect={value_cell_rect} value_cell_text_raw_preview=\"{value_raw_preview}\" "
-        f"value_regex=\"{value_regex}\" tag_candidates={candidates} tag_pick=\"{tag_text}\" "
+        f"value_regex=\"{value_regex}\" tag_pick=\"{tag_text}\" error=\"{error}\" "
         "tag_source=CELL_ADJACENT"
     )
 
@@ -1657,52 +1655,43 @@ class ITRAutofillTab(ttk.Frame):
         direction = (match_cfg.get("tag_direction", "RIGHT") or "RIGHT").upper()
         page1 = doc[start_page - 1]
 
+        value_regex = (match_cfg.get("pdf_extract_regex", "") or "").strip() or DEFAULT_VALUE_REGEX
         print(f"pdf={os.path.basename(pdf_path)} start_page=P{start_page} anchor_norm={key_norm}")
-        value_normed, debug = extract_tag_by_cell_adjacency(page1, key_norm, direction)
+        value_normed, debug = extract_tag_by_cell_adjacency(page1, key_norm, direction, value_regex)
         key_cell_rect = debug.get("key_cell_rect")
         key_cell_text_raw = debug.get("key_cell_text_raw", "")
         key_cell_text_norm = debug.get("key_cell_text_norm", "")
         value_cell_rect = debug.get("value_cell_rect")
         value_raw = debug.get("value_cell_text_raw", "") or ""
         value_raw_preview = (value_raw or "")[:200]
+        vcover_count = debug.get("vcover_count")
+        hcover_count = debug.get("hcover_count")
+        chosen_line = debug.get("chosen_line")
+        error = debug.get("error", "")
         print(
             f"key_cell_rect={key_cell_rect} key_cell_text_raw=\"{key_cell_text_raw}\" "
-            f"key_cell_text_norm=\"{key_cell_text_norm}\" direction={direction}"
+            f"key_cell_text_norm=\"{key_cell_text_norm}\" direction={direction} "
+            f"vcover_count={vcover_count} hcover_count={hcover_count} chosen_line={chosen_line} "
+            f"value_cell_rect={value_cell_rect} value_cell_text_raw_preview=\"{value_raw_preview}\" "
+            f"value_regex=\"{value_regex}\" error=\"{error}\""
         )
         if not value_normed:
-            if debug.get("error") == "match_cell_not_found":
+            if debug.get("error") == "anchor_cell_not_found":
                 print(f"未找到 key_norm={key_norm} 的单元格（严格等值匹配）")
+            elif debug.get("error") == "regex_no_match":
+                print(f"value_cell 有文本，但 regex 截取失败；value_raw={value_raw_preview}; regex={value_regex}")
             else:
                 print(f"找到 key_norm 单元格，但 direction={direction} 的相邻单元格不存在/为空")
             return "", "missing"
 
-        value_normed = normalize_cell_text(value_raw or value_normed)
-        value_regex = (match_cfg.get("pdf_extract_regex", "") or "").strip() or DEFAULT_VALUE_REGEX
-        try:
-            candidates = extract_candidates_in_cell_text(value_normed, value_regex)
-        except re.error as exc:
-            print(f"正则无效，无法截取：{exc}")
-            return "", "missing"
-        if not candidates:
-            print(f"value_cell 有文本，但 regex 截取失败；value_raw={value_raw_preview}; regex={value_regex}")
-            return "", "missing"
-
-        tag_value = ""
-        if len(candidates) == 1:
-            tag_value = candidates[0]
-        else:
-            tag_value, _ = self._thread_tag_candidate_chooser(os.path.basename(pdf_path), candidates)
-        if not tag_value:
-            return "", "missing"
-
-        tag_value = norm_key_value(tag_value)
+        tag_value = norm_key_value(value_normed)
         for suf in match_cfg.get("strip_suffixes", []):
             suf_up = norm_key_value(suf)
             if suf_up and tag_value.endswith(suf_up):
                 tag_value = tag_value[: -len(suf_up)]
         print(
             f"value_cell_rect={value_cell_rect} value_cell_text_raw_preview=\"{value_raw_preview}\" "
-            f"value_regex=\"{value_regex}\" tag_candidates={candidates} tag_pick=\"{tag_value}\" "
+            f"value_regex=\"{value_regex}\" tag_pick=\"{tag_value}\" error=\"{error}\" "
             "tag_source=CELL_ADJACENT"
         )
         self.tag_choice_cache[cache_key] = {"value": tag_value, "source": "CELL_ADJACENT"}
