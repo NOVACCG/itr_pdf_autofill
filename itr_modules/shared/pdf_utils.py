@@ -348,38 +348,46 @@ def extract_tag_by_cell_adjacency(
     debug["ys_col_len"] = len(ys_col)
     debug["ys_col_head"] = ys_col[:6]
 
+    fallback_used = False
     y0 = max((y for y in ys_col if y <= cy), default=match_cell.y0 - 1)
     y1 = min((y for y in ys_col if y >= cy), default=match_cell.y1 + 1)
-    if y1 <= y0:
+    if not ys_col or y1 <= y0:
         y0, y1 = match_cell.y0 - 1, match_cell.y1 + 1
+        fallback_used = True
+        debug["fallback_reason"] = "missing_horizontal"
 
     direction = (direction or "RIGHT").upper()
     value_cell = None
     margin = 36
+    cell_margin = 1.0
     eps2 = 1.0
     if direction == "RIGHT":
         x0_line = next((x for x in xs_row if x >= match_cell.x1 - eps2), None)
         if x0_line is not None:
             x0 = x0_line
         else:
-            x0 = match_cell.x1 + eps2
-            debug["fallback_x0_used"] = True
-            debug["fallback_x0_reason"] = "missing_vertical"
+            x0 = match_cell.x1 + cell_margin
+            fallback_used = True
+            debug["fallback_reason"] = "missing_vertical"
         x1 = next((x for x in xs_row if x > x0 + eps), None)
         if x1 is None:
             x1 = page.rect.x1 - margin
+            fallback_used = True
+            debug["fallback_reason"] = "missing_vertical"
         value_cell = fitz.Rect(x0, y0, x1, y1)
     elif direction == "LEFT":
         x1_line = next((x for x in reversed(xs_row) if x <= match_cell.x0 + eps2), None)
         if x1_line is not None:
             x1 = x1_line
         else:
-            x1 = match_cell.x0 - eps2
-            debug["fallback_x1_used"] = True
-            debug["fallback_x1_reason"] = "missing_vertical"
+            x1 = match_cell.x0 - cell_margin
+            fallback_used = True
+            debug["fallback_reason"] = "missing_vertical"
         x0 = next((x for x in reversed(xs_row) if x < x1 - eps), None)
         if x0 is None:
             x0 = page.rect.x0 + margin
+            fallback_used = True
+            debug["fallback_reason"] = "missing_vertical"
         value_cell = fitz.Rect(x0, y0, x1, y1)
     elif direction == "DOWN":
         y0_down = next((y for y in ys_col if y > match_cell.y1 + eps), None)
@@ -403,6 +411,8 @@ def extract_tag_by_cell_adjacency(
     debug.update({"y0": y0, "y1": y1})
     if value_cell:
         debug.update({"x0": value_cell.x0, "x1": value_cell.x1})
+    if fallback_used:
+        debug["fallback_used"] = True
 
     raw = get_cell_text(page, value_cell)
     normed = normalize_cell_text(raw)
@@ -476,38 +486,46 @@ def extract_tag_by_cell_adjacency_candidates(
     debug["ys_col_len"] = len(ys_col)
     debug["ys_col_head"] = ys_col[:6]
 
+    fallback_used = False
     y0 = max((y for y in ys_col if y <= cy), default=match_cell.y0 - 1)
     y1 = min((y for y in ys_col if y >= cy), default=match_cell.y1 + 1)
-    if y1 <= y0:
+    if not ys_col or y1 <= y0:
         y0, y1 = match_cell.y0 - 1, match_cell.y1 + 1
+        fallback_used = True
+        debug["fallback_reason"] = "missing_horizontal"
 
     direction = (direction or "RIGHT").upper()
     value_cell = None
     margin = 36
+    cell_margin = 1.0
     eps2 = 1.0
     if direction == "RIGHT":
         x0_line = next((x for x in xs_row if x >= match_cell.x1 - eps2), None)
         if x0_line is not None:
             x0 = x0_line
         else:
-            x0 = match_cell.x1 + eps2
-            debug["fallback_x0_used"] = True
-            debug["fallback_x0_reason"] = "missing_vertical"
+            x0 = match_cell.x1 + cell_margin
+            fallback_used = True
+            debug["fallback_reason"] = "missing_vertical"
         x1 = next((x for x in xs_row if x > x0 + eps), None)
         if x1 is None:
             x1 = page.rect.x1 - margin
+            fallback_used = True
+            debug["fallback_reason"] = "missing_vertical"
         value_cell = fitz.Rect(x0, y0, x1, y1)
     elif direction == "LEFT":
         x1_line = next((x for x in reversed(xs_row) if x <= match_cell.x0 + eps2), None)
         if x1_line is not None:
             x1 = x1_line
         else:
-            x1 = match_cell.x0 - eps2
-            debug["fallback_x1_used"] = True
-            debug["fallback_x1_reason"] = "missing_vertical"
+            x1 = match_cell.x0 - cell_margin
+            fallback_used = True
+            debug["fallback_reason"] = "missing_vertical"
         x0 = next((x for x in reversed(xs_row) if x < x1 - eps), None)
         if x0 is None:
             x0 = page.rect.x0 + margin
+            fallback_used = True
+            debug["fallback_reason"] = "missing_vertical"
         value_cell = fitz.Rect(x0, y0, x1, y1)
     elif direction == "DOWN":
         y0_down = next((y for y in ys_col if y > match_cell.y1 + eps), None)
@@ -531,6 +549,8 @@ def extract_tag_by_cell_adjacency_candidates(
     debug.update({"y0": y0, "y1": y1})
     if value_cell:
         debug.update({"x0": value_cell.x0, "x1": value_cell.x1})
+    if fallback_used:
+        debug["fallback_used"] = True
 
     raw = get_cell_text(page, value_cell)
     normed = normalize_cell_text(raw)
