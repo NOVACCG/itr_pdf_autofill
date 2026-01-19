@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from typing import List
 
@@ -480,6 +481,87 @@ def extract_tag_by_cell_adjacency_candidates(
         debug["error"] = "adjacent_cell_empty"
         return None, debug
     return normed, debug
+
+
+def find_adjacent_cell_with_tolerance(
+    page: fitz.Page,
+    key_rect: fitz.Rect,
+    direction: str,
+    tol: float = 4.0,
+    overlap_ratio: float = 0.6,
+) -> tuple[fitz.Rect | None, dict]:
+    words = page.get_text("words") or []
+    debug = {"direction": direction, "tol": tol, "overlap_ratio": overlap_ratio}
+    if not words:
+        debug["error"] = "no_words"
+        return None, debug
+
+    direction = (direction or "RIGHT").upper()
+    key_h = max(key_rect.height, 1.0)
+    key_w = max(key_rect.width, 1.0)
+    hits = []
+    for x0, y0, x1, y1, w, *_ in words:
+        rect = fitz.Rect(x0, y0, x1, y1)
+        if direction in {"RIGHT", "LEFT"}:
+            overlap = max(0.0, min(key_rect.y1, rect.y1) - max(key_rect.y0, rect.y0))
+            if overlap < overlap_ratio * key_h:
+                continue
+            if direction == "RIGHT":
+                if abs(rect.x0 - key_rect.x1) <= tol:
+                    hits.append(rect)
+            else:
+                if abs(rect.x1 - key_rect.x0) <= tol:
+                    hits.append(rect)
+        else:
+            overlap = max(0.0, min(key_rect.x1, rect.x1) - max(key_rect.x0, rect.x0))
+            if overlap < overlap_ratio * key_w:
+                continue
+            if direction == "DOWN":
+                if abs(rect.y0 - key_rect.y1) <= tol:
+                    hits.append(rect)
+            else:
+                if abs(rect.y1 - key_rect.y0) <= tol:
+                    hits.append(rect)
+
+    if hits:
+        hits.sort(key=lambda r: (r.y0, r.x0))
+        debug["match"] = "tolerance"
+        return hits[0], debug
+
+    fallback = []
+    for x0, y0, x1, y1, w, *_ in words:
+        rect = fitz.Rect(x0, y0, x1, y1)
+        overlap = max(0.0, min(key_rect.y1, rect.y1) - max(key_rect.y0, rect.y0))
+        if overlap < overlap_ratio * key_h:
+            continue
+        if rect.x0 > key_rect.x1:
+            fallback.append(rect)
+    if fallback:
+        fallback.sort(key=lambda r: r.x0)
+        debug["match"] = "fallback_right_band"
+        return fallback[0], debug
+
+    debug["error"] = "adjacent_cell_not_found"
+    return None, debug
+
+
+def extract_candidates_in_cell_text(text: str, regex_pattern: str) -> list[str]:
+    rx = re.compile(regex_pattern, re.IGNORECASE)
+    candidates: list[str] = []
+    seen = set()
+    for match in rx.finditer(text or ""):
+        value = match.group(1) if match.groups() else match.group(0)
+        value = normalize_cell_text(value)
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        candidates.append(value)
+    return candidates
+
+
+def template_fingerprint(preset_name: str, key_norm: str, direction: str, value_regex: str) -> str:
+    base = f"{preset_name}::{key_norm}::{direction}::{value_regex}"
+    return hashlib.sha1(base.encode("utf-8")).hexdigest()
 
 
 def _norm_join_words(words_in_row) -> str:
@@ -1009,11 +1091,14 @@ __all__ = [
     "extract_tag_by_cell_adjacency_candidates",
     "extract_tag_candidates_from_text",
     "extract_tag_candidates_first_page",
+    "extract_candidates_in_cell_text",
     "fit_text_to_box",
     "find_cell_by_candidates",
+    "find_adjacent_cell_with_tolerance",
     "get_cell_text_cached",
     "is_valid_tag_value",
     "normalize_cell_text",
     "norm_text",
     "row_band_from_ys",
+    "template_fingerprint",
 ]

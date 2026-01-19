@@ -36,10 +36,13 @@ APP_VERSION = "V1.0.3"
 
 from itr_modules.shared.paths import BASE_DIR, ensure_output_dir, ensure_report_dir, get_batch_id, open_in_file_explorer
 from itr_modules.shared.pdf_utils import (
-    extract_tag_by_cell_adjacency_candidates,
-    extract_tag_candidates_from_text,
+    extract_candidates_in_cell_text,
+    extract_rulings,
+    find_cell_by_exact_norm,
+    find_adjacent_cell_with_tolerance,
     fit_text_to_box,
     norm_text,
+    template_fingerprint,
 )
 
 PRESETS_DIR = os.path.join(BASE_DIR, "presets")
@@ -48,6 +51,7 @@ OUTPUT_TEST_ROOT = os.path.join(BASE_DIR, "output", MODULE_NAME, "test")
 OUTPUT_FILLED_ROOT = os.path.join(BASE_DIR, "output", MODULE_NAME, "filled")
 GLOBAL_CONFIG_PATH = os.path.join(BASE_DIR, "config_global.json")
 MATCH_MEMORY_PATH = os.path.join(BASE_DIR, "match_memory.json")
+TAG_CHOICE_MEMORY_PATH = os.path.join(BASE_DIR, "tag_choice_memory.json")
 
 os.makedirs(PRESETS_DIR, exist_ok=True)
 os.makedirs(OUTPUT_TEST_ROOT, exist_ok=True)
@@ -56,9 +60,8 @@ ensure_report_dir(MODULE_NAME, get_batch_id())
 
 DEFAULT_PAGE1_MARK_RE = re.compile(r"Page\s*1\s*of\s*(\d+)", re.IGNORECASE)
 DEFAULT_TAG_RE = re.compile(r"TAG\s*NO\.\s*:\s*([A-Za-z0-9\-\._/]+)", re.IGNORECASE)
+DEFAULT_VALUE_REGEX = r"([A-Za-z0-9\-\._/]+)"
 TAG_DIRECTION_OPTIONS = ["RIGHT", "LEFT", "DOWN", "UP"]
-TAG_MODE_CELL = "CELL_A"
-TAG_MODE_REGEX = "REGEX_PAGE"
 
 SIDE_OPTIONS = ["", "LEFT", "RIGHT"]
 RULE_OPTIONS = ["", "SHEET_NAME", "PDF_NAME", "TODAY", "EMPTY"]
@@ -154,8 +157,7 @@ def default_preset() -> dict:
         "page1_mark_regex": r"Page\s*1\s*of\s*(\d+)",
         "match": {
             "key_name": "TAG",
-            "pdf_extract_regex": r"TAG\s*NO\.\s*:\s*([A-Za-z0-9\-\._/]+)",
-            "tag_mode": TAG_MODE_CELL,
+            "pdf_extract_regex": DEFAULT_VALUE_REGEX,
             "tag_direction": "RIGHT",
             "strip_suffixes": ["-EX"],  # 例如 PDF 里是 627-xx-Ex，而 Excel 里是 627-xx
             "excel_key_col_candidates_norm": ["TAGNO", "TAG", "TAGNUMBER", "EQUIPMENTTAG"],
@@ -771,6 +773,7 @@ class ITRAutofillTab(ttk.Frame):
 
         self.global_cfg = load_global_config()
         self.match_memory = load_match_memory()
+        self.tag_choice_memory = load_json_safe(TAG_CHOICE_MEMORY_PATH, {})
         self._loaded_preset_name: Optional[str] = None
 
         self.excel_path: Optional[str] = None
@@ -919,23 +922,9 @@ class ITRAutofillTab(ttk.Frame):
 
         mk1 = ttk.Frame(mk)
         mk1.pack(fill="x", padx=10, pady=6)
-        ttk.Label(mk1, text="Key 名称").pack(side="left")
+        ttk.Label(mk1, text="Key 归一值").pack(side="left")
         self.ent_key_name = ttk.Entry(mk1, width=20)
         self.ent_key_name.pack(side="left", padx=8)
-        ttk.Label(mk1, text="Tag 抓取方式").pack(side="left", padx=(20, 4))
-        self.tag_mode_var = tk.StringVar(value=TAG_MODE_CELL)
-        ttk.Radiobutton(
-            mk1,
-            text="方法A（相邻单元格）",
-            variable=self.tag_mode_var,
-            value=TAG_MODE_CELL,
-        ).pack(side="left")
-        ttk.Radiobutton(
-            mk1,
-            text="正则（整页扫描）",
-            variable=self.tag_mode_var,
-            value=TAG_MODE_REGEX,
-        ).pack(side="left", padx=(8, 0))
 
         mk1b = ttk.Frame(mk)
         mk1b.pack(fill="x", padx=10, pady=6)
@@ -945,7 +934,7 @@ class ITRAutofillTab(ttk.Frame):
             mk1b, self.tag_direction_var, self.tag_direction_var.get(), *TAG_DIRECTION_OPTIONS
         )
         self.tag_direction_menu.pack(side="left")
-        ttk.Label(mk1b, text="PDF提取规则(正则)").pack(side="left", padx=(20, 4))
+        ttk.Label(mk1b, text="值提取正则").pack(side="left", padx=(20, 4))
         self.ent_pdf_key_re = ttk.Entry(mk1b, width=60)
         self.ent_pdf_key_re.pack(side="left", padx=8)
 
@@ -998,7 +987,6 @@ class ITRAutofillTab(ttk.Frame):
         self.field_tree.bind("<Double-1>", self.on_field_edit)
 
         self._bind_preset_change_events()
-        self._refresh_tag_mode_controls()
         self.refresh_preset_list()
 
     def refresh_preset_list(self):
@@ -1021,21 +1009,7 @@ class ITRAutofillTab(ttk.Frame):
             ent.bind("<KeyRelease>", lambda _e: self._mark_preset_modified())
         self.var_enable_fuzzy.trace_add("write", lambda *_: self._mark_preset_modified())
         self.tag_direction_var.trace_add("write", lambda *_: self._mark_preset_modified())
-        self.tag_mode_var.trace_add("write", self._on_tag_mode_change)
         self.var_require_confirm.trace_add("write", lambda *_: self._mark_preset_modified())
-
-    def _on_tag_mode_change(self, *_args):
-        self._refresh_tag_mode_controls()
-        self._mark_preset_modified()
-
-    def _refresh_tag_mode_controls(self):
-        mode = self.tag_mode_var.get() or TAG_MODE_CELL
-        if mode == TAG_MODE_REGEX:
-            self.ent_pdf_key_re.config(state="normal")
-            self.tag_direction_menu.config(state="disabled")
-        else:
-            self.ent_pdf_key_re.config(state="disabled")
-            self.tag_direction_menu.config(state="normal")
 
     def _mark_preset_modified(self):
         if self.preset_confirmed:
@@ -1104,7 +1078,6 @@ class ITRAutofillTab(ttk.Frame):
         self.ent_key_name.insert(0, str(m.get("key_name", "TAG")))
         self.ent_pdf_key_re.delete(0, tk.END)
         self.ent_pdf_key_re.insert(0, str(m.get("pdf_extract_regex", default_preset()["match"]["pdf_extract_regex"])))
-        self.tag_mode_var.set(str(m.get("tag_mode", TAG_MODE_CELL)))
         self.tag_direction_var.set(str(m.get("tag_direction", "RIGHT")).upper())
         self.ent_strip_suf.delete(0, tk.END)
         self.ent_strip_suf.insert(0, ",".join(m.get("strip_suffixes", ["-EX"])))
@@ -1115,7 +1088,6 @@ class ITRAutofillTab(ttk.Frame):
 
         self._render_fields_tree(d.get("fields", []))
         self._set_preset_confirmed(False)
-        self._refresh_tag_mode_controls()
         self._update_main_preset_status()
 
     def _render_fields_tree(self, fields: List[dict]):
@@ -1229,7 +1201,6 @@ class ITRAutofillTab(ttk.Frame):
         d["match"]["pdf_extract_regex"] = self.ent_pdf_key_re.get().strip() or default_preset()["match"][
             "pdf_extract_regex"
         ]
-        d["match"]["tag_mode"] = self.tag_mode_var.get() or TAG_MODE_CELL
         d["match"]["tag_direction"] = (self.tag_direction_var.get() or "RIGHT").upper()
         d["match"]["strip_suffixes"] = [x.strip() for x in self.ent_strip_suf.get().split(",") if x.strip()]
         d["match"]["excel_key_col_candidates_norm"] = [x.strip() for x in self.ent_key_cols.get().split(",") if x.strip()]
@@ -1508,9 +1479,7 @@ class ITRAutofillTab(ttk.Frame):
             text=f"当前预设：{active} | 创建：{p.get('created_at', '-')} | 修改：{p.get('updated_at', '-')}"
         )
         m = p.get("match", {})
-        tag_mode = m.get("tag_mode", TAG_MODE_CELL)
-        regex_ok = bool(m.get("pdf_extract_regex", "").strip()) if tag_mode == TAG_MODE_REGEX else True
-        ok = regex_ok and bool(m.get("excel_key_col_candidates_norm", [])) and bool(p.get("fields", []))
+        ok = bool(m.get("key_name", "").strip()) and bool(p.get("fields", []))
         self.btn_parse.config(state=("normal" if ok else "disabled"))
 
     def pick_excel(self):
@@ -1532,7 +1501,7 @@ class ITRAutofillTab(ttk.Frame):
             self.pdf_paths = list(paths)
             self.lbl_pdfs.config(text=f"{len(self.pdf_paths)} 个PDF")
 
-    def gui_tag_candidate_chooser(self, pdf_name: str, candidates: List[dict]) -> str:
+    def gui_tag_candidate_chooser(self, pdf_name: str, candidates: List[str]) -> Tuple[str, bool]:
         win = tk.Toplevel(self)
         win.title("Tag 候选选择")
         win.geometry("600x420")
@@ -1542,25 +1511,32 @@ class ITRAutofillTab(ttk.Frame):
 
         lb = tk.Listbox(win, height=12, width=80)
         lb.pack(fill="both", expand=True, padx=10, pady=6)
-        values = [c.get("value", "") for c in candidates]
-        for v in values:
+        for v in candidates:
             lb.insert(tk.END, v)
 
-        chosen = {"val": ""}
+        remember_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            win,
+            text="记住该选择（同模板下次自动选中）",
+            variable=remember_var,
+        ).pack(anchor="w", padx=10, pady=(0, 6))
+
+        chosen = {"val": "", "remember": False}
 
         def pick():
             sel = lb.curselection()
             if not sel:
                 messagebox.showwarning("提示", "请先选择一个候选")
                 return
-            chosen["val"] = values[sel[0]]
+            chosen["val"] = candidates[sel[0]]
+            chosen["remember"] = bool(remember_var.get())
             win.destroy()
 
         ttk.Button(win, text="确定", command=pick).pack(pady=8)
         win.grab_set()
         self.wait_window(win)
 
-        return chosen["val"]
+        return chosen["val"], chosen["remember"]
 
     def gui_fuzzy_chooser(self, key_pdf: str, short_key: str, candidates: List[str]) -> str:
         win = tk.Toplevel(self)
@@ -1643,71 +1619,68 @@ class ITRAutofillTab(ttk.Frame):
     def _tag_cache_key(self, pdf_path: str, start_page: int, tag_mode: str) -> str:
         return f"{pdf_path}::p{start_page}::{tag_mode}"
 
-    def _extract_tag_candidates_for_itr(self, doc: fitz.Document, start_page: int, pattern: str) -> List[dict]:
-        page = doc[start_page - 1]
-        text = page.get_text("text") or ""
-        return extract_tag_candidates_from_text(text, pattern)
-
     def _resolve_itr_tag(self, doc: fitz.Document, pdf_path: str, start_page: int, preset: dict) -> Tuple[str, str]:
         match_cfg = preset.get("match", {})
-        tag_mode = match_cfg.get("tag_mode", TAG_MODE_CELL)
-        cache_key = self._tag_cache_key(pdf_path, start_page, tag_mode)
+        cache_key = self._tag_cache_key(pdf_path, start_page, "CELL_A")
         cached = self.tag_choice_cache.get(cache_key)
         if cached and cached.get("value"):
             return cached["value"], cached.get("source", "regex_manual")
         key_name = match_cfg.get("key_name", "TAG")
-        candidates = match_cfg.get("excel_key_col_candidates_norm", []) or []
-        candidates = [c.strip() for c in candidates if str(c).strip()]
+        key_norm = norm_text(key_name)
         direction = (match_cfg.get("tag_direction", "RIGHT") or "RIGHT").upper()
         page1 = doc[start_page - 1]
 
-        if tag_mode == TAG_MODE_CELL:
-            print(f"Key 名称={key_name}（仅显示用，不参与定位）")
-            print(f"方法A：使用 candidates={candidates} 定位 matchkey 单元格")
-            tag_value, debug = extract_tag_by_cell_adjacency_candidates(page1, candidates, direction)
-            if debug.get("matched_candidate"):
-                print(
-                    f"命中 matchkey 候选={debug.get('matched_candidate')}, "
-                    f"cell_norm={debug.get('cell_norm')}, cell_rect={debug.get('cell_rect')}"
-                )
-            if tag_value:
-                tag_value = norm_key_value(tag_value)
-                for suf in match_cfg.get("strip_suffixes", []):
-                    suf_up = norm_key_value(suf)
-                    if suf_up and tag_value.endswith(suf_up):
-                        tag_value = tag_value[: -len(suf_up)]
-                self.tag_choice_cache[cache_key] = {"value": tag_value, "source": "cell_adjacency"}
-                return tag_value, "cell_adjacency"
-            if debug.get("error") == "match_cell_not_found":
-                print("未找到任何 matchkey 候选（严格/endswith 匹配）")
-            else:
-                print(f"找到 matchkey 单元格，但 direction={direction} 的相邻单元格为空/不存在")
-            print("你可以切换到【正则】模式后重试")
+        print(f"Key 名称={key_name}（仅显示用，不参与定位）")
+        print(f"方法A：使用 key_norm={key_norm} 定位 matchkey 单元格")
+        key_cell = find_cell_by_exact_norm(page1, key_norm, *extract_rulings(page1))
+        if not key_cell:
+            print(f"未找到 key_norm={key_norm} 的单元格（严格等值匹配）")
             return "", "missing"
 
-        regex_pattern = match_cfg.get("pdf_extract_regex", "").strip()
-        if not regex_pattern:
-            print("未填写正则，无法扫描")
+        adj_rect, adj_debug = find_adjacent_cell_with_tolerance(page1, key_cell, direction)
+        if not adj_rect:
+            print(f"找到 key_norm 单元格，但 direction={direction} 的相邻单元格不存在")
             return "", "missing"
+
+        value_text = page1.get_text("text", clip=adj_rect) or ""
+        value_text = value_text.strip()
+        if not value_text:
+            print("相邻格文本为空")
+            return "", "missing"
+
+        value_regex = (match_cfg.get("pdf_extract_regex", "") or "").strip() or DEFAULT_VALUE_REGEX
         try:
-            candidates = self._extract_tag_candidates_for_itr(doc, start_page, regex_pattern)
+            candidates = extract_candidates_in_cell_text(value_text, value_regex)
         except re.error as exc:
             print(f"正则无效，无法扫描：{exc}")
             return "", "missing"
         if not candidates:
-            print("未匹配到 tag 候选")
+            print("正则未命中")
             return "", "missing"
-        if len(candidates) == 1:
-            value = candidates[0].get("value", "")
-            if value:
-                self.tag_choice_cache[cache_key] = {"value": value, "source": "regex_auto"}
-            return value, "regex_auto"
 
-        value = self._thread_tag_candidate_chooser(os.path.basename(pdf_path), candidates)
-        if value:
-            self.tag_choice_cache[cache_key] = {"value": value, "source": "regex_manual"}
-            return value, "regex_manual"
-        return "", "missing"
+        preset_name = preset.get("preset_name", "")
+        fingerprint = template_fingerprint(preset_name, key_norm, direction, value_regex)
+        remembered = self.tag_choice_memory.get(fingerprint, "")
+        if remembered and remembered in candidates:
+            tag_value = remembered
+        elif len(candidates) == 1:
+            tag_value = candidates[0]
+        else:
+            tag_value, remember = self._thread_tag_candidate_chooser(os.path.basename(pdf_path), candidates)
+            if remember and tag_value:
+                self.tag_choice_memory[fingerprint] = tag_value
+                save_json_safe(TAG_CHOICE_MEMORY_PATH, self.tag_choice_memory)
+
+        if not tag_value:
+            return "", "missing"
+
+        tag_value = norm_key_value(tag_value)
+        for suf in match_cfg.get("strip_suffixes", []):
+            suf_up = norm_key_value(suf)
+            if suf_up and tag_value.endswith(suf_up):
+                tag_value = tag_value[: -len(suf_up)]
+        self.tag_choice_cache[cache_key] = {"value": tag_value, "source": "cell_adjacency"}
+        return tag_value, "cell_adjacency"
 
     def _preview_worker(self, preset: dict):
         try:
@@ -1789,12 +1762,12 @@ class ITRAutofillTab(ttk.Frame):
 
         self._preview_q.put(("done", items, excel_index))
 
-    def _thread_tag_candidate_chooser(self, pdf_name: str, candidates: List[dict]) -> str:
+    def _thread_tag_candidate_chooser(self, pdf_name: str, candidates: List[str]) -> Tuple[str, bool]:
         event = threading.Event()
-        box = {"val": ""}
+        box = {"val": "", "remember": False}
         self._preview_q.put(("tag_request", pdf_name, candidates, box, event))
         event.wait()
-        return box["val"]
+        return box["val"], box["remember"]
 
     def _thread_fuzzy_chooser(self, key_pdf: str, short_key: str, candidates: List[str]) -> str:
         event = threading.Event()
@@ -1820,8 +1793,9 @@ class ITRAutofillTab(ttk.Frame):
                     event.set()
                 elif kind == "tag_request":
                     pdf_name, candidates, box, event = msg[1:]
-                    pick = self.gui_tag_candidate_chooser(pdf_name, candidates)
+                    pick, remember = self.gui_tag_candidate_chooser(pdf_name, candidates)
                     box["val"] = pick
+                    box["remember"] = remember
                     event.set()
                 elif kind == "done":
                     items, excel_index = msg[1], msg[2]
