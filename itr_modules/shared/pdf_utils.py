@@ -448,3 +448,87 @@ def draw_checkmark(page: fitz.Page, rr: fitz.Rect, width: float = 1.6) -> None:
 
     page.draw_line(p1, p2, width=width)
     page.draw_line(p2, p3, width=width)
+
+
+def extract_table_grid_lines(
+    page: fitz.Page,
+    table_bbox: fitz.Rect,
+    verticals: list[tuple[float, float, float]],
+    horizontals: list[tuple[float, float, float]],
+    pad: float = 0.5,
+) -> tuple[list[float], list[float]]:
+    """Extract table grid x/y coordinates within the table bbox."""
+    xs = []
+    ys = []
+    for x, y0, y1 in verticals:
+        if y1 >= table_bbox.y0 - pad and y0 <= table_bbox.y1 + pad:
+            if table_bbox.x0 - pad <= x <= table_bbox.x1 + pad:
+                xs.append(x)
+    for y, x0, x1 in horizontals:
+        if x1 >= table_bbox.x0 - pad and x0 <= table_bbox.x1 + pad:
+            if table_bbox.y0 - pad <= y <= table_bbox.y1 + pad:
+                ys.append(y)
+
+    xs.extend([table_bbox.x0, table_bbox.x1])
+    ys.extend([table_bbox.y0, table_bbox.y1])
+
+    xs = _uniq_sorted(xs, tol=0.6)
+    ys = _uniq_sorted(ys, tol=0.6)
+    return xs, ys
+
+
+def snap_to_grid_x(cx: float, xs: list[float]) -> tuple[float, float] | None:
+    """Find nearest left/right grid lines that bound cx."""
+    if not xs or len(xs) < 2:
+        return None
+    xs = sorted(xs)
+    left = None
+    right = None
+    for x in xs:
+        if x <= cx:
+            left = x
+        if x >= cx and right is None:
+            right = x
+    if left is None or right is None:
+        return None
+    if left == right:
+        for i in range(len(xs) - 1):
+            if xs[i] <= cx <= xs[i + 1]:
+                return xs[i], xs[i + 1]
+        return None
+    return left, right
+
+
+def row_band_from_ys(index: int, ys: list[float]) -> tuple[float, float] | None:
+    if index < 0 or index + 1 >= len(ys):
+        return None
+    return ys[index], ys[index + 1]
+
+
+def row_index_from_ys(ys: list[float], y_center: float) -> int:
+    for i in range(len(ys) - 1):
+        if ys[i] - 1 <= y_center <= ys[i + 1] + 1:
+            return i
+    return -1
+
+
+def split_columns_from_grid(xs: list[float], x0: float, x1: float, count: int) -> list[tuple[float, float]]:
+    """Split a span into count columns, snapping to grid lines."""
+    if count <= 0:
+        return []
+    xs_sorted = sorted([x for x in xs if x0 - 1 <= x <= x1 + 1])
+    if len(xs_sorted) < 2:
+        return []
+    if count == 1:
+        return [(xs_sorted[0], xs_sorted[-1])]
+    total_segments = len(xs_sorted) - 1
+    step = max(1, total_segments // count)
+    bounds = []
+    start_idx = 0
+    for i in range(count):
+        end_idx = start_idx + step
+        if i == count - 1 or end_idx >= total_segments:
+            end_idx = total_segments
+        bounds.append((xs_sorted[start_idx], xs_sorted[end_idx]))
+        start_idx = end_idx
+    return bounds

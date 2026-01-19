@@ -12,16 +12,19 @@ import fitz
 
 from itr_modules.shared.paths import OUTPUT_ROOT, ensure_output_dir, get_batch_id, open_in_file_explorer
 from itr_modules.shared.pdf_utils import (
-    _snap_col_bounds,
-    _unique_sorted_x_from_verticals,
     build_table_row_lines,
     extract_rulings,
+    extract_table_grid_lines,
     find_cell_by_exact_norm,
     find_lowest_header_anchor,
     get_cell_text,
     header_row_band,
     is_pure_int,
     norm_text,
+    row_band_from_ys,
+    row_index_from_ys,
+    snap_to_grid_x,
+    split_columns_from_grid,
 )
 
 
@@ -95,28 +98,18 @@ def _find_header_cells(
     return cells
 
 
-def _find_column_bounds(
-    verticals: list[tuple[float, float, float]],
-    header_rect: fitz.Rect | None,
-) -> tuple[float, float] | None:
+def _find_column_bounds(xs: list[float], header_rect: fitz.Rect | None) -> tuple[float, float] | None:
     if not header_rect:
         return None
-    xs = _unique_sorted_x_from_verticals(verticals)
-    if xs:
-        bounds = _snap_col_bounds(xs, (header_rect.x0 + header_rect.x1) / 2.0)
-        if bounds:
-            return bounds
-    return (header_rect.x0, header_rect.x1)
+    cx = (header_rect.x0 + header_rect.x1) / 2.0
+    return snap_to_grid_x(cx, xs)
 
 
-def _header_row_index(row_bounds: list[tuple[float, float]], header_rect: fitz.Rect | None) -> int:
-    if not header_rect or not row_bounds:
+def _header_row_index(ys: list[float], header_rect: fitz.Rect | None) -> int:
+    if not header_rect or not ys:
         return -1
     cy = (header_rect.y0 + header_rect.y1) / 2.0
-    for idx, (y0, y1) in enumerate(row_bounds):
-        if y0 - 1 <= cy <= y1 + 1:
-            return idx
-    return -1
+    return row_index_from_ys(ys, cy)
 
 
 class CheckItemsTestTab(ttk.Frame):
@@ -295,6 +288,7 @@ class CheckItemsTestTab(ttk.Frame):
                 row_bounds = _row_bounds_from_lines(row_lines) if row_lines else _row_bounds_from_words(words)
 
                 table_rect = _table_rect_from_data(page, verticals, row_bounds, words)
+                xs, ys = extract_table_grid_lines(page, table_rect, verticals, horizontals)
                 search_clip = header_band if header_band else table_rect
                 header_cells = _find_header_cells(page, header_norms, verticals, horizontals, search_clip)
                 if header_band is None and header_cells:
@@ -306,20 +300,23 @@ class CheckItemsTestTab(ttk.Frame):
                     )
 
                 index_header = header_cells.get(index_norm) or header_anchor
-                index_bounds = _find_column_bounds(verticals, index_header)
+                index_bounds = _find_column_bounds(xs, index_header)
                 if not index_bounds:
                     continue
 
-                header_row_idx = _header_row_index(row_bounds, index_header)
-                data_rows = row_bounds[header_row_idx + 1 :] if header_row_idx >= 0 else row_bounds
+                header_row_idx = _header_row_index(ys, index_header)
 
                 expected = 1
-                numbered_rows: list[tuple[float, float]] = []
-                for y0, y1 in data_rows:
+                numbered_rows: list[int] = []
+                for i in range(header_row_idx + 1, len(ys) - 1):
+                    band = row_band_from_ys(i, ys)
+                    if not band:
+                        continue
+                    y0, y1 = band
                     cell = fitz.Rect(index_bounds[0], y0, index_bounds[1], y1)
                     cell_text = get_cell_text(page, cell)
                     if is_pure_int(cell_text) and int(cell_text) == expected:
-                        numbered_rows.append((y0, y1))
+                        numbered_rows.append(i)
                         expected += 1
                     elif expected > 1:
                         break
@@ -330,16 +327,45 @@ class CheckItemsTestTab(ttk.Frame):
                 for rect in header_cells.values():
                     page.draw_rect(rect, color=(0, 0, 1), width=1.2)
 
-                for y0, y1 in numbered_rows:
+                for row_idx in numbered_rows:
+                    band = row_band_from_ys(row_idx, ys)
+                    if not band:
+                        continue
+                    y0, y1 = band
                     page.draw_rect(fitz.Rect(index_bounds[0], y0, index_bounds[1], y1), color=(0, 0, 1), width=1.2)
 
+                state_bounds_map: dict[str, tuple[float, float]] = {}
                 for state_norm in state_norms:
                     state_header = header_cells.get(state_norm)
-                    state_bounds = _find_column_bounds(verticals, state_header)
+                    bounds = _find_column_bounds(xs, state_header)
+                    if bounds:
+                        state_bounds_map[state_norm] = bounds
+
+                if len(state_bounds_map) != len(state_norms):
+                    if state_bounds_map:
+                        x0 = min(b[0] for b in state_bounds_map.values())
+                        x1 = max(b[1] for b in state_bounds_map.values())
+                    else:
+                        x0 = table_rect.x0
+                        x1 = table_rect.x1
+                    splits = split_columns_from_grid(xs, x0, x1, len(state_norms))
+                    for state_norm, bounds in zip(state_norms, splits):
+                        state_bounds_map.setdefault(state_norm, bounds)
+
+                for state_norm in state_norms:
+                    state_bounds = state_bounds_map.get(state_norm)
                     if not state_bounds:
                         continue
-                    for y0, y1 in numbered_rows:
-                        page.draw_rect(fitz.Rect(state_bounds[0], y0, state_bounds[1], y1), color=(0, 0, 1), width=1.2)
+                    for row_idx in numbered_rows:
+                        band = row_band_from_ys(row_idx, ys)
+                        if not band:
+                            continue
+                        y0, y1 = band
+                        page.draw_rect(
+                            fitz.Rect(state_bounds[0], y0, state_bounds[1], y1),
+                            color=(0, 0, 1),
+                            width=1.2,
+                        )
 
             doc.save(out_pdf)
             doc.close()
