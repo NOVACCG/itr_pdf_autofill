@@ -348,28 +348,35 @@ def extract_tag_by_cell_adjacency(
     debug["ys_col_len"] = len(ys_col)
     debug["ys_col_head"] = ys_col[:6]
 
-    y0 = max((y for y in ys_col if y <= cy), default=match_cell.y0)
-    y1 = min((y for y in ys_col if y >= cy), default=match_cell.y1)
+    y0 = max((y for y in ys_col if y <= cy), default=match_cell.y0 - 1)
+    y1 = min((y for y in ys_col if y >= cy), default=match_cell.y1 + 1)
     if y1 <= y0:
-        y0, y1 = match_cell.y0, match_cell.y1
+        y0, y1 = match_cell.y0 - 1, match_cell.y1 + 1
 
     direction = (direction or "RIGHT").upper()
     value_cell = None
     margin = 36
+    eps2 = 1.0
     if direction == "RIGHT":
-        x0 = next((x for x in xs_row if x > match_cell.x1 + eps), None)
-        if x0 is None:
-            debug["error"] = "adjacent_cell_not_found"
-            return None, debug
+        x0_line = next((x for x in xs_row if x >= match_cell.x1 - eps2), None)
+        if x0_line is not None:
+            x0 = x0_line
+        else:
+            x0 = match_cell.x1 + eps2
+            debug["fallback_x0_used"] = True
+            debug["fallback_x0_reason"] = "missing_vertical"
         x1 = next((x for x in xs_row if x > x0 + eps), None)
         if x1 is None:
             x1 = page.rect.x1 - margin
         value_cell = fitz.Rect(x0, y0, x1, y1)
     elif direction == "LEFT":
-        x1 = next((x for x in reversed(xs_row) if x < match_cell.x0 - eps), None)
-        if x1 is None:
-            debug["error"] = "adjacent_cell_not_found"
-            return None, debug
+        x1_line = next((x for x in reversed(xs_row) if x <= match_cell.x0 + eps2), None)
+        if x1_line is not None:
+            x1 = x1_line
+        else:
+            x1 = match_cell.x0 - eps2
+            debug["fallback_x1_used"] = True
+            debug["fallback_x1_reason"] = "missing_vertical"
         x0 = next((x for x in reversed(xs_row) if x < x1 - eps), None)
         if x0 is None:
             x0 = page.rect.x0 + margin
@@ -469,28 +476,35 @@ def extract_tag_by_cell_adjacency_candidates(
     debug["ys_col_len"] = len(ys_col)
     debug["ys_col_head"] = ys_col[:6]
 
-    y0 = max((y for y in ys_col if y <= cy), default=match_cell.y0)
-    y1 = min((y for y in ys_col if y >= cy), default=match_cell.y1)
+    y0 = max((y for y in ys_col if y <= cy), default=match_cell.y0 - 1)
+    y1 = min((y for y in ys_col if y >= cy), default=match_cell.y1 + 1)
     if y1 <= y0:
-        y0, y1 = match_cell.y0, match_cell.y1
+        y0, y1 = match_cell.y0 - 1, match_cell.y1 + 1
 
     direction = (direction or "RIGHT").upper()
     value_cell = None
     margin = 36
+    eps2 = 1.0
     if direction == "RIGHT":
-        x0 = next((x for x in xs_row if x > match_cell.x1 + eps), None)
-        if x0 is None:
-            debug["error"] = "adjacent_cell_not_found"
-            return None, debug
+        x0_line = next((x for x in xs_row if x >= match_cell.x1 - eps2), None)
+        if x0_line is not None:
+            x0 = x0_line
+        else:
+            x0 = match_cell.x1 + eps2
+            debug["fallback_x0_used"] = True
+            debug["fallback_x0_reason"] = "missing_vertical"
         x1 = next((x for x in xs_row if x > x0 + eps), None)
         if x1 is None:
             x1 = page.rect.x1 - margin
         value_cell = fitz.Rect(x0, y0, x1, y1)
     elif direction == "LEFT":
-        x1 = next((x for x in reversed(xs_row) if x < match_cell.x0 - eps), None)
-        if x1 is None:
-            debug["error"] = "adjacent_cell_not_found"
-            return None, debug
+        x1_line = next((x for x in reversed(xs_row) if x <= match_cell.x0 + eps2), None)
+        if x1_line is not None:
+            x1 = x1_line
+        else:
+            x1 = match_cell.x0 - eps2
+            debug["fallback_x1_used"] = True
+            debug["fallback_x1_reason"] = "missing_vertical"
         x0 = next((x for x in reversed(xs_row) if x < x1 - eps), None)
         if x0 is None:
             x0 = page.rect.x0 + margin
