@@ -37,9 +37,8 @@ APP_VERSION = "V1.0.3"
 from itr_modules.shared.paths import BASE_DIR, ensure_output_dir, ensure_report_dir, get_batch_id, open_in_file_explorer
 from itr_modules.shared.pdf_utils import (
     extract_tag_by_cell_adjacency,
-    extract_tag_candidates_first_page,
+    extract_tag_candidates_from_text,
     fit_text_to_box,
-    is_valid_tag_value,
     norm_text,
 )
 
@@ -57,8 +56,9 @@ ensure_report_dir(MODULE_NAME, get_batch_id())
 
 DEFAULT_PAGE1_MARK_RE = re.compile(r"Page\s*1\s*of\s*(\d+)", re.IGNORECASE)
 DEFAULT_TAG_RE = re.compile(r"TAG\s*NO\.\s*:\s*([A-Za-z0-9\-\._/]+)", re.IGNORECASE)
-DEFAULT_TAG_CANDIDATE_PATTERN = r"([A-Za-z0-9][A-Za-z0-9\-\._/]{3,50})"
-TAG_DIRECTION_OPTIONS = ["RIGHT", "DOWN"]
+TAG_DIRECTION_OPTIONS = ["RIGHT", "LEFT", "DOWN", "UP"]
+TAG_MODE_CELL = "CELL_A"
+TAG_MODE_REGEX = "REGEX_PAGE"
 
 SIDE_OPTIONS = ["", "LEFT", "RIGHT"]
 RULE_OPTIONS = ["", "SHEET_NAME", "PDF_NAME", "TODAY", "EMPTY"]
@@ -155,6 +155,7 @@ def default_preset() -> dict:
         "match": {
             "key_name": "TAG",
             "pdf_extract_regex": r"TAG\s*NO\.\s*:\s*([A-Za-z0-9\-\._/]+)",
+            "tag_mode": TAG_MODE_CELL,
             "tag_direction": "RIGHT",
             "strip_suffixes": ["-EX"],  # 例如 PDF 里是 627-xx-Ex，而 Excel 里是 627-xx
             "excel_key_col_candidates_norm": ["TAGNO", "TAG", "TAGNUMBER", "EQUIPMENTTAG"],
@@ -915,15 +916,32 @@ class ITRAutofillTab(ttk.Frame):
         ttk.Label(mk1, text="Key 名称").pack(side="left")
         self.ent_key_name = ttk.Entry(mk1, width=20)
         self.ent_key_name.pack(side="left", padx=8)
-        ttk.Label(mk1, text="PDF提取规则(正则)").pack(side="left", padx=(20, 4))
-        self.ent_pdf_key_re = ttk.Entry(mk1, width=60)
-        self.ent_pdf_key_re.pack(side="left", padx=8)
+        ttk.Label(mk1, text="Tag 抓取方式").pack(side="left", padx=(20, 4))
+        self.tag_mode_var = tk.StringVar(value=TAG_MODE_CELL)
+        ttk.Radiobutton(
+            mk1,
+            text="方法A（相邻单元格）",
+            variable=self.tag_mode_var,
+            value=TAG_MODE_CELL,
+        ).pack(side="left")
+        ttk.Radiobutton(
+            mk1,
+            text="正则（整页扫描）",
+            variable=self.tag_mode_var,
+            value=TAG_MODE_REGEX,
+        ).pack(side="left", padx=(8, 0))
 
-        ttk.Label(mk1, text="Tag 值方向").pack(side="left", padx=(20, 4))
+        mk1b = ttk.Frame(mk)
+        mk1b.pack(fill="x", padx=10, pady=6)
+        ttk.Label(mk1b, text="Tag 值方向").pack(side="left", padx=(0, 4))
         self.tag_direction_var = tk.StringVar(value="RIGHT")
-        ttk.OptionMenu(mk1, self.tag_direction_var, self.tag_direction_var.get(), *TAG_DIRECTION_OPTIONS).pack(
-            side="left"
+        self.tag_direction_menu = ttk.OptionMenu(
+            mk1b, self.tag_direction_var, self.tag_direction_var.get(), *TAG_DIRECTION_OPTIONS
         )
+        self.tag_direction_menu.pack(side="left")
+        ttk.Label(mk1b, text="PDF提取规则(正则)").pack(side="left", padx=(20, 4))
+        self.ent_pdf_key_re = ttk.Entry(mk1b, width=60)
+        self.ent_pdf_key_re.pack(side="left", padx=8)
 
         mk2 = ttk.Frame(mk)
         mk2.pack(fill="x", padx=10, pady=6)
@@ -974,6 +992,7 @@ class ITRAutofillTab(ttk.Frame):
         self.field_tree.bind("<Double-1>", self.on_field_edit)
 
         self._bind_preset_change_events()
+        self._refresh_tag_mode_controls()
         self.refresh_preset_list()
 
     def refresh_preset_list(self):
@@ -996,7 +1015,21 @@ class ITRAutofillTab(ttk.Frame):
             ent.bind("<KeyRelease>", lambda _e: self._mark_preset_modified())
         self.var_enable_fuzzy.trace_add("write", lambda *_: self._mark_preset_modified())
         self.tag_direction_var.trace_add("write", lambda *_: self._mark_preset_modified())
+        self.tag_mode_var.trace_add("write", self._on_tag_mode_change)
         self.var_require_confirm.trace_add("write", lambda *_: self._mark_preset_modified())
+
+    def _on_tag_mode_change(self, *_args):
+        self._refresh_tag_mode_controls()
+        self._mark_preset_modified()
+
+    def _refresh_tag_mode_controls(self):
+        mode = self.tag_mode_var.get() or TAG_MODE_CELL
+        if mode == TAG_MODE_REGEX:
+            self.ent_pdf_key_re.config(state="normal")
+            self.tag_direction_menu.config(state="disabled")
+        else:
+            self.ent_pdf_key_re.config(state="disabled")
+            self.tag_direction_menu.config(state="normal")
 
     def _mark_preset_modified(self):
         if self.preset_confirmed:
@@ -1065,6 +1098,7 @@ class ITRAutofillTab(ttk.Frame):
         self.ent_key_name.insert(0, str(m.get("key_name", "TAG")))
         self.ent_pdf_key_re.delete(0, tk.END)
         self.ent_pdf_key_re.insert(0, str(m.get("pdf_extract_regex", default_preset()["match"]["pdf_extract_regex"])))
+        self.tag_mode_var.set(str(m.get("tag_mode", TAG_MODE_CELL)))
         self.tag_direction_var.set(str(m.get("tag_direction", "RIGHT")).upper())
         self.ent_strip_suf.delete(0, tk.END)
         self.ent_strip_suf.insert(0, ",".join(m.get("strip_suffixes", ["-EX"])))
@@ -1075,6 +1109,7 @@ class ITRAutofillTab(ttk.Frame):
 
         self._render_fields_tree(d.get("fields", []))
         self._set_preset_confirmed(False)
+        self._refresh_tag_mode_controls()
         self._update_main_preset_status()
 
     def _render_fields_tree(self, fields: List[dict]):
@@ -1188,6 +1223,7 @@ class ITRAutofillTab(ttk.Frame):
         d["match"]["pdf_extract_regex"] = self.ent_pdf_key_re.get().strip() or default_preset()["match"][
             "pdf_extract_regex"
         ]
+        d["match"]["tag_mode"] = self.tag_mode_var.get() or TAG_MODE_CELL
         d["match"]["tag_direction"] = (self.tag_direction_var.get() or "RIGHT").upper()
         d["match"]["strip_suffixes"] = [x.strip() for x in self.ent_strip_suf.get().split(",") if x.strip()]
         d["match"]["excel_key_col_candidates_norm"] = [x.strip() for x in self.ent_key_cols.get().split(",") if x.strip()]
@@ -1466,9 +1502,9 @@ class ITRAutofillTab(ttk.Frame):
             text=f"当前预设：{active} | 创建：{p.get('created_at', '-')} | 修改：{p.get('updated_at', '-')}"
         )
         m = p.get("match", {})
-        ok = bool(m.get("pdf_extract_regex", "").strip()) and bool(m.get("excel_key_col_candidates_norm", [])) and bool(
-            p.get("fields", [])
-        )
+        tag_mode = m.get("tag_mode", TAG_MODE_CELL)
+        regex_ok = bool(m.get("pdf_extract_regex", "").strip()) if tag_mode == TAG_MODE_REGEX else True
+        ok = regex_ok and bool(m.get("excel_key_col_candidates_norm", [])) and bool(p.get("fields", []))
         self.btn_parse.config(state=("normal" if ok else "disabled"))
 
     def pick_excel(self):
@@ -1598,34 +1634,49 @@ class ITRAutofillTab(ttk.Frame):
         self._preview_thread.start()
         self.after(120, self._poll_preview_queue)
 
-    def _tag_cache_key(self, pdf_path: str, start_page: int) -> str:
-        return f"{pdf_path}::p{start_page}"
+    def _tag_cache_key(self, pdf_path: str, start_page: int, tag_mode: str) -> str:
+        return f"{pdf_path}::p{start_page}::{tag_mode}"
 
     def _extract_tag_candidates_for_itr(self, doc: fitz.Document, start_page: int, pattern: str) -> List[dict]:
-        temp = fitz.open()
-        temp.insert_pdf(doc, from_page=start_page - 1, to_page=start_page - 1)
-        try:
-            return extract_tag_candidates_first_page(temp, pattern)
-        finally:
-            temp.close()
+        page = doc[start_page - 1]
+        text = page.get_text("text") or ""
+        return extract_tag_candidates_from_text(text, pattern)
 
     def _resolve_itr_tag(self, doc: fitz.Document, pdf_path: str, start_page: int, preset: dict) -> Tuple[str, str]:
-        cache_key = self._tag_cache_key(pdf_path, start_page)
+        match_cfg = preset.get("match", {})
+        tag_mode = match_cfg.get("tag_mode", TAG_MODE_CELL)
+        cache_key = self._tag_cache_key(pdf_path, start_page, tag_mode)
         cached = self.tag_choice_cache.get(cache_key)
         if cached and cached.get("value"):
             return cached["value"], cached.get("source", "regex_manual")
-
-        matchkey_norm = norm_text(preset.get("match", {}).get("key_name", "TAG"))
-        direction = (preset.get("match", {}).get("tag_direction", "RIGHT") or "RIGHT").upper()
+        key_name = match_cfg.get("key_name", "TAG")
+        matchkey_norm = norm_text(key_name)
+        direction = (match_cfg.get("tag_direction", "RIGHT") or "RIGHT").upper()
         page1 = doc[start_page - 1]
-        tag_value, _debug = extract_tag_by_cell_adjacency(page1, matchkey_norm, direction)
-        if tag_value and is_valid_tag_value(tag_value):
-            self.tag_choice_cache[cache_key] = {"value": tag_value, "source": "cell_adjacency"}
-            return tag_value, "cell_adjacency"
 
-        regex_pattern = preset.get("match", {}).get("pdf_extract_regex", "") or DEFAULT_TAG_CANDIDATE_PATTERN
-        candidates = self._extract_tag_candidates_for_itr(doc, start_page, regex_pattern)
+        if tag_mode == TAG_MODE_CELL:
+            tag_value, debug = extract_tag_by_cell_adjacency(page1, matchkey_norm, direction)
+            if tag_value:
+                self.tag_choice_cache[cache_key] = {"value": tag_value, "source": "cell_adjacency"}
+                return tag_value, "cell_adjacency"
+            if debug.get("error") == "match_cell_not_found":
+                print(f"未找到 matchkey={key_name} 的单元格（严格等值匹配）")
+            else:
+                print(f"找到 matchkey 单元格，但 direction={direction} 的相邻单元格为空/不存在")
+            print("你可以切换到【正则】模式后重试")
+            return "", "missing"
+
+        regex_pattern = match_cfg.get("pdf_extract_regex", "").strip()
+        if not regex_pattern:
+            print("未填写正则，无法扫描")
+            return "", "missing"
+        try:
+            candidates = self._extract_tag_candidates_for_itr(doc, start_page, regex_pattern)
+        except re.error as exc:
+            print(f"正则无效，无法扫描：{exc}")
+            return "", "missing"
         if not candidates:
+            print("未匹配到 tag 候选")
             return "", "missing"
         if len(candidates) == 1:
             value = candidates[0].get("value", "")

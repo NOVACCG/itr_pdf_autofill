@@ -150,6 +150,11 @@ def norm_text(s: str) -> str:
     return re.sub(r"[^A-Z0-9]+", "", (s or "").upper())
 
 
+def normalize_cell_text(s: str) -> str:
+    """Trim and collapse whitespace for cell content."""
+    return re.sub(r"\s+", " ", str(s or "")).strip()
+
+
 def is_valid_tag_value(s: str) -> bool:
     if s is None:
         return False
@@ -163,24 +168,14 @@ def is_valid_tag_value(s: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9\-\._/]+", val))
 
 
-def extract_tag_candidates_first_page(doc: fitz.Document, regex_pattern: str) -> list[dict]:
-    try:
-        rx = re.compile(regex_pattern, re.IGNORECASE)
-    except re.error:
-        rx = re.compile(r"([A-Za-z0-9][A-Za-z0-9\-\._/]{3,50})", re.IGNORECASE)
-
-    page = doc[0]
-    text = page.get_text("text") or ""
+def extract_tag_candidates_from_text(text: str, regex_pattern: str) -> list[dict]:
+    rx = re.compile(regex_pattern, re.IGNORECASE)
     candidates: list[dict] = []
     seen = set()
-    for idx, match in enumerate(rx.finditer(text)):
+    for idx, match in enumerate(rx.finditer(text or "")):
         value = match.group(1) if match.groups() else match.group(0)
-        if not value:
-            continue
-        value = value.strip()
-        if not is_valid_tag_value(value):
-            continue
-        if value in seen:
+        value = normalize_cell_text(value)
+        if not value or value in seen:
             continue
         seen.add(value)
         line_hint = None
@@ -199,6 +194,12 @@ def extract_tag_candidates_first_page(doc: fitz.Document, regex_pattern: str) ->
             "line_hint": line_hint,
         })
     return candidates
+
+
+def extract_tag_candidates_first_page(doc: fitz.Document, regex_pattern: str) -> list[dict]:
+    page = doc[0]
+    text = page.get_text("text") or ""
+    return extract_tag_candidates_from_text(text, regex_pattern)
 
 
 def parse_pages_per_itr_regex(doc: fitz.Document, pattern: str, scan_pages: int) -> int | None:
@@ -333,11 +334,13 @@ def extract_tag_by_cell_adjacency(
     match_cell = find_cell_by_exact_norm(page, matchkey_norm, verticals, horizontals)
     debug = {"match_cell": match_cell, "direction": direction}
     if not match_cell:
+        debug["error"] = "match_cell_not_found"
         return None, debug
 
     xs = _unique_sorted_x_from_verticals(verticals)
     ys = _uniq_sorted([y for y, _, _ in horizontals])
     if len(xs) < 2 or len(ys) < 2:
+        debug["error"] = "grid_not_found"
         return None, debug
 
     cx = (match_cell.x0 + match_cell.x1) / 2.0
@@ -349,6 +352,7 @@ def extract_tag_by_cell_adjacency(
             break
     row_idx = row_index_from_ys(ys, cy)
     if col_idx is None or row_idx < 0:
+        debug["error"] = "cell_index_not_found"
         return None, debug
 
     direction = (direction or "RIGHT").upper()
@@ -356,16 +360,27 @@ def extract_tag_by_cell_adjacency(
     if direction == "DOWN":
         if row_idx + 2 < len(ys):
             value_cell = fitz.Rect(xs[col_idx], ys[row_idx + 1], xs[col_idx + 1], ys[row_idx + 2])
+    elif direction == "UP":
+        if row_idx - 1 >= 0:
+            value_cell = fitz.Rect(xs[col_idx], ys[row_idx - 1], xs[col_idx + 1], ys[row_idx])
+    elif direction == "LEFT":
+        if col_idx - 1 >= 0:
+            value_cell = fitz.Rect(xs[col_idx - 1], ys[row_idx], xs[col_idx], ys[row_idx + 1])
     else:
         if col_idx + 2 < len(xs):
             value_cell = fitz.Rect(xs[col_idx + 1], ys[row_idx], xs[col_idx + 2], ys[row_idx + 1])
 
     if not value_cell:
+        debug["error"] = "adjacent_cell_not_found"
         return None, debug
 
     raw = get_cell_text(page, value_cell)
-    debug.update({"value_cell": value_cell, "raw": raw, "norm": norm_text(raw)})
-    return (raw.strip() if raw else None), debug
+    normed = normalize_cell_text(raw)
+    debug.update({"value_cell": value_cell, "raw": raw, "norm": normed})
+    if not normed:
+        debug["error"] = "adjacent_cell_empty"
+        return None, debug
+    return normed, debug
 
 
 def _norm_join_words(words_in_row) -> str:
@@ -892,10 +907,12 @@ __all__ = [
     "detect_checkitems_table",
     "draw_checkmark",
     "extract_tag_by_cell_adjacency",
+    "extract_tag_candidates_from_text",
     "extract_tag_candidates_first_page",
     "fit_text_to_box",
     "get_cell_text_cached",
     "is_valid_tag_value",
+    "normalize_cell_text",
     "norm_text",
     "row_band_from_ys",
 ]
