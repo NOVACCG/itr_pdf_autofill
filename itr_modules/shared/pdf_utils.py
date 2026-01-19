@@ -338,6 +338,33 @@ def extract_tag_by_cell_adjacency(
         debug["error"] = "match_cell_not_found"
         return None, debug
 
+    key_words = []
+    for x0, y0, x1, y1, w, *_ in page.get_text("words", clip=match_cell) or []:
+        wn = norm_text(w)
+        if not wn:
+            continue
+        if wn in matchkey_norm or matchkey_norm in wn:
+            key_words.append((x0, y0, x1, y1))
+    if not key_words:
+        candidates = []
+        for x0, y0, x1, y1, w, *_ in page.get_text("words") or []:
+            wn = norm_text(w)
+            if wn and (wn == matchkey_norm or wn in matchkey_norm or matchkey_norm in wn):
+                candidates.append((x0, y0, x1, y1))
+        if candidates:
+            candidates.sort(key=lambda r: abs(r[1] - match_cell.y0))
+            key_words = candidates
+    if key_words:
+        key_bbox = fitz.Rect(
+            min(r[0] for r in key_words),
+            min(r[1] for r in key_words),
+            max(r[2] for r in key_words),
+            max(r[3] for r in key_words),
+        )
+    else:
+        key_bbox = match_cell
+    debug["key_bbox"] = key_bbox
+
     eps = 0.5
     row_pad = max(6.0, match_cell.height * 0.6)
     row_y0 = match_cell.y0 - row_pad
@@ -358,14 +385,21 @@ def extract_tag_by_cell_adjacency(
     debug["ys_col_len"] = len(ys_col)
     debug["ys_col_head"] = ys_col[:6]
 
+    divider_x = next((x for x in xs_row if x > key_bbox.x1 + 0.5), None)
+    if divider_x is None:
+        divider_x = key_bbox.x1 + 2.0
+    divider_left_x = next((x for x in reversed(xs_row) if x < key_bbox.x0 - 0.5), None)
+    if divider_left_x is None:
+        divider_left_x = key_bbox.x0 - 2.0
+    debug["divider_x"] = divider_x
+    debug["divider_left_x"] = divider_left_x
+
     direction = (direction or "RIGHT").upper()
     value_cell = None
     margin = 36
     eps2 = 1.0
     if direction == "RIGHT":
-        x0 = next((x for x in xs_row if x >= match_cell.x1 - eps2), None)
-        if x0 is None:
-            x0 = match_cell.x1 + 1.0
+        x0 = divider_x
         x1 = next((x for x in xs_row if x > x0 + 1.0), None)
         if x1 is None:
             x1 = page.rect.x1 - margin
@@ -401,12 +435,13 @@ def extract_tag_by_cell_adjacency(
     debug["raw_preview"] = (raw or "")[:80]
     fallback_words_used = False
     fallback_words_count = 0
+    picked_words_sample = []
     if not normalize_cell_text(raw):
         words = page.get_text("words", clip=row_band) or []
         picked = []
         if direction == "RIGHT":
             for x0, y0, x1, y1, w, *_ in words:
-                if x0 < match_cell.x1 - 1.0:
+                if x0 < divider_x - 0.5:
                     continue
                 overlap = max(0.0, min(y1, row_y1) - max(y0, row_y0))
                 height = max(y1 - y0, 1.0)
@@ -414,7 +449,7 @@ def extract_tag_by_cell_adjacency(
                     picked.append((x0, y0, x1, y1))
         elif direction == "LEFT":
             for x0, y0, x1, y1, w, *_ in words:
-                if x1 > match_cell.x0 + 1.0:
+                if x1 > divider_left_x + 0.5:
                     continue
                 overlap = max(0.0, min(y1, row_y1) - max(y0, row_y0))
                 height = max(y1 - y0, 1.0)
@@ -436,6 +471,7 @@ def extract_tag_by_cell_adjacency(
                 width = max(x1 - x0, 1.0)
                 if overlap / width >= 0.4:
                     picked.append((x0, y0, x1, y1))
+        picked_words_sample = picked[:5]
         fallback_words_count = len(picked)
         if picked:
             x0_min = min(r[0] for r in picked) - 2
@@ -450,6 +486,7 @@ def extract_tag_by_cell_adjacency(
     debug.update({
         "fallback_words_used": fallback_words_used,
         "fallback_words_count": fallback_words_count,
+        "picked_words_sample": picked_words_sample,
         "value_cell_after_fallback": value_cell if fallback_words_used else None,
         "value_cell": value_cell,
         "raw": raw,
@@ -516,6 +553,33 @@ def extract_tag_by_cell_adjacency_candidates(
     if not match_cell:
         return None, debug
 
+    key_words = []
+    for x0, y0, x1, y1, w, *_ in page.get_text("words", clip=match_cell) or []:
+        wn = norm_text(w)
+        if not wn:
+            continue
+        if any(wn in norm_text(c) or norm_text(c) in wn for c in candidates):
+            key_words.append((x0, y0, x1, y1))
+    if not key_words:
+        candidates_words = []
+        for x0, y0, x1, y1, w, *_ in page.get_text("words") or []:
+            wn = norm_text(w)
+            if wn and any(wn == norm_text(c) or wn in norm_text(c) or norm_text(c) in wn for c in candidates):
+                candidates_words.append((x0, y0, x1, y1))
+        if candidates_words:
+            candidates_words.sort(key=lambda r: abs(r[1] - match_cell.y0))
+            key_words = candidates_words
+    if key_words:
+        key_bbox = fitz.Rect(
+            min(r[0] for r in key_words),
+            min(r[1] for r in key_words),
+            max(r[2] for r in key_words),
+            max(r[3] for r in key_words),
+        )
+    else:
+        key_bbox = match_cell
+    debug["key_bbox"] = key_bbox
+
     eps = 0.5
     row_pad = max(6.0, match_cell.height * 0.6)
     row_y0 = match_cell.y0 - row_pad
@@ -536,14 +600,21 @@ def extract_tag_by_cell_adjacency_candidates(
     debug["ys_col_len"] = len(ys_col)
     debug["ys_col_head"] = ys_col[:6]
 
+    divider_x = next((x for x in xs_row if x > key_bbox.x1 + 0.5), None)
+    if divider_x is None:
+        divider_x = key_bbox.x1 + 2.0
+    divider_left_x = next((x for x in reversed(xs_row) if x < key_bbox.x0 - 0.5), None)
+    if divider_left_x is None:
+        divider_left_x = key_bbox.x0 - 2.0
+    debug["divider_x"] = divider_x
+    debug["divider_left_x"] = divider_left_x
+
     direction = (direction or "RIGHT").upper()
     value_cell = None
     margin = 36
     eps2 = 1.0
     if direction == "RIGHT":
-        x0 = next((x for x in xs_row if x >= match_cell.x1 - eps2), None)
-        if x0 is None:
-            x0 = match_cell.x1 + 1.0
+        x0 = divider_x
         x1 = next((x for x in xs_row if x > x0 + 1.0), None)
         if x1 is None:
             x1 = page.rect.x1 - margin
@@ -579,12 +650,13 @@ def extract_tag_by_cell_adjacency_candidates(
     debug["raw_preview"] = (raw or "")[:80]
     fallback_words_used = False
     fallback_words_count = 0
+    picked_words_sample = []
     if not normalize_cell_text(raw):
         words = page.get_text("words", clip=row_band) or []
         picked = []
         if direction == "RIGHT":
             for x0, y0, x1, y1, w, *_ in words:
-                if x0 < match_cell.x1 - 1.0:
+                if x0 < divider_x - 0.5:
                     continue
                 overlap = max(0.0, min(y1, row_y1) - max(y0, row_y0))
                 height = max(y1 - y0, 1.0)
@@ -592,7 +664,7 @@ def extract_tag_by_cell_adjacency_candidates(
                     picked.append((x0, y0, x1, y1))
         elif direction == "LEFT":
             for x0, y0, x1, y1, w, *_ in words:
-                if x1 > match_cell.x0 + 1.0:
+                if x1 > divider_left_x + 0.5:
                     continue
                 overlap = max(0.0, min(y1, row_y1) - max(y0, row_y0))
                 height = max(y1 - y0, 1.0)
@@ -614,6 +686,7 @@ def extract_tag_by_cell_adjacency_candidates(
                 width = max(x1 - x0, 1.0)
                 if overlap / width >= 0.4:
                     picked.append((x0, y0, x1, y1))
+        picked_words_sample = picked[:5]
         fallback_words_count = len(picked)
         if picked:
             x0_min = min(r[0] for r in picked) - 2
@@ -628,6 +701,7 @@ def extract_tag_by_cell_adjacency_candidates(
     debug.update({
         "fallback_words_used": fallback_words_used,
         "fallback_words_count": fallback_words_count,
+        "picked_words_sample": picked_words_sample,
         "value_cell_after_fallback": value_cell if fallback_words_used else None,
         "value_cell": value_cell,
         "raw": raw,
