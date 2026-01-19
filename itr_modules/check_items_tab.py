@@ -1,4 +1,4 @@
-"""CheckItems (non-Ex) tab: test table detection and manage manual checkmarks."""
+"""CheckItems (non-Ex) tab: table detection test + manual checkmarks."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import tkinter as tk
 import fitz
 
 from itr_modules.shared.paths import OUTPUT_ROOT, ensure_output_dir, get_batch_id, open_in_file_explorer
-from itr_modules.shared.pdf_utils import detect_checkitems_table, draw_checkmark, norm_text, row_band_from_ys
+from itr_modules.shared.pdf_utils import detect_checkitems_table, norm_text, row_band_from_ys
 
 MODULE_NAME = "check_items"
 
@@ -109,10 +109,6 @@ class CheckItemsTestTab(ttk.Frame):
         self.tag_list.configure(yscrollcommand=tag_sb.set)
         self.tag_list.bind("<<ListboxSelect>>", self._on_tag_select)
 
-        grid_top = ttk.Frame(grid_frame)
-        grid_top.pack(fill=tk.X)
-        ttk.Button(grid_top, text="导出打勾 PDF", command=self.export_filled).pack(side=tk.RIGHT)
-
         self.mark_tree = ttk.Treeview(grid_frame, columns=("OK", "NA", "PL"), show="tree headings", height=10)
         self.mark_tree.heading("#0", text="Item")
         self.mark_tree.heading("OK", text="OK")
@@ -191,16 +187,23 @@ class CheckItemsTestTab(ttk.Frame):
 
         try:
             doc = fitz.open(pdf_path)
-        except Exception:
+        except Exception as exc:
+            self._log(f"[检测失败] 无法打开 PDF：{Path(pdf_path).name} ({exc})")
             return
 
         for page in doc:
-            info = detect_checkitems_table(page, header_norms, index_norm, state_norms)
+            try:
+                info = detect_checkitems_table(page, header_norms, index_norm, state_norms)
+            except Exception as exc:
+                self._log(f"[检测失败] 解析表格异常：{Path(pdf_path).name} ({exc})")
+                continue
             row_count = len(info.get("numbered_rows") or [])
             if row_count:
                 entry["item_count"] = row_count
                 break
         doc.close()
+        if entry.get("item_count", 0) == 0:
+            self._log(f"[检测失败] 未识别到有效序号行：{Path(pdf_path).name}")
         self._save_state()
 
     def pick_pdfs(self):
@@ -386,55 +389,3 @@ class CheckItemsTestTab(ttk.Frame):
             self._q.put(("log", f"[Test] 已生成：{out_pdf}"))
 
         self._q.put(("done", out_dir))
-
-    def export_filled(self) -> None:
-        if not self.pdf_paths:
-            messagebox.showwarning("提示", "请先批量导入 PDF")
-            return
-
-        header_norms = _parse_norm_list(self.header_norms_var.get())
-        index_norm = norm_text(self.index_col_norm_var.get())
-        state_norms = _parse_norm_list(self.state_col_norms_var.get())
-        if not header_norms or not index_norm or not state_norms:
-            messagebox.showwarning("提示", "请检查 HEADER_NORMS / INDEX_COL_NORM / STATE_COL_NORMS 配置")
-            return
-
-        batch_id = get_batch_id()
-        out_dir = ensure_output_dir(MODULE_NAME, "filled", batch_id)
-        for pdf_path in self.pdf_paths:
-            marks = (self.state.get(pdf_path, {}) or {}).get("marks", {}) or {}
-            if not marks:
-                continue
-            try:
-                doc = fitz.open(pdf_path)
-            except Exception:
-                continue
-
-            for page in doc:
-                info = detect_checkitems_table(page, header_norms, index_norm, state_norms)
-                ys = info.get("grid_ys", [])
-                numbered_rows = info.get("numbered_rows", [])
-                state_bounds = info.get("state_bounds", {})
-                if not (ys and numbered_rows and state_bounds):
-                    continue
-
-                for idx, row_idx in enumerate(numbered_rows, start=1):
-                    mark = marks.get(str(idx), "")
-                    if not mark:
-                        continue
-                    bounds = state_bounds.get(mark)
-                    if not bounds:
-                        continue
-                    band = row_band_from_ys(row_idx, ys)
-                    if not band:
-                        continue
-                    y0, y1 = band
-                    rect = fitz.Rect(bounds[0], y0, bounds[1], y1)
-                    draw_checkmark(page, rect, width=1.6)
-
-            out_pdf = out_dir / f"{Path(pdf_path).stem}_filled.pdf"
-            doc.save(out_pdf)
-            doc.close()
-            self._log(f"[导出] {out_pdf}")
-
-        messagebox.showinfo("完成", f"已导出到：\n{out_dir}")
