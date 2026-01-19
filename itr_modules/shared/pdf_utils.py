@@ -532,3 +532,163 @@ def split_columns_from_grid(xs: list[float], x0: float, x1: float, count: int) -
         bounds.append((xs_sorted[start_idx], xs_sorted[end_idx]))
         start_idx = end_idx
     return bounds
+
+
+def _row_bounds_from_lines(row_lines: list[float]) -> list[tuple[float, float]]:
+    return [(y0, y1) for y0, y1 in zip(row_lines, row_lines[1:]) if y1 - y0 > 4]
+
+
+def _row_bounds_from_words(words: list[tuple]) -> list[tuple[float, float]]:
+    rows: dict[int, list[tuple[float, float]]] = {}
+    for w in words:
+        line_no = w[6]
+        rows.setdefault(line_no, []).append((w[1], w[3]))
+    bounds = []
+    for ys in rows.values():
+        y0 = min(y for y, _ in ys)
+        y1 = max(y for _, y in ys)
+        bounds.append((y0, y1))
+    bounds.sort(key=lambda r: r[0])
+    return bounds
+
+
+def _table_rect_from_data(
+    page: fitz.Page,
+    verticals: list[tuple[float, float, float]],
+    row_bounds: list[tuple[float, float]],
+    words: list[tuple],
+) -> fitz.Rect:
+    if verticals:
+        xs = [x for x, _, _ in verticals]
+        x0 = min(xs)
+        x1 = max(xs)
+    elif words:
+        x0 = min(w[0] for w in words)
+        x1 = max(w[2] for w in words)
+    else:
+        x0 = page.rect.x0
+        x1 = page.rect.x1
+
+    if row_bounds:
+        y0 = min(r[0] for r in row_bounds)
+        y1 = max(r[1] for r in row_bounds)
+    elif words:
+        y0 = min(w[1] for w in words)
+        y1 = max(w[3] for w in words)
+    else:
+        y0 = page.rect.y0
+        y1 = page.rect.y1
+
+    return fitz.Rect(x0, y0, x1, y1)
+
+
+def _find_header_cells(
+    page: fitz.Page,
+    header_norms: list[str],
+    verticals,
+    horizontals,
+    search_clip: fitz.Rect | None,
+) -> dict[str, fitz.Rect]:
+    cells: dict[str, fitz.Rect] = {}
+    for norm in header_norms:
+        rect = find_cell_by_exact_norm(page, norm, verticals, horizontals, search_clip=search_clip)
+        if rect:
+            cells[norm] = rect
+    return cells
+
+
+def _find_column_bounds(xs: list[float], header_rect: fitz.Rect | None) -> tuple[float, float] | None:
+    if not header_rect:
+        return None
+    cx = (header_rect.x0 + header_rect.x1) / 2.0
+    return snap_to_grid_x(cx, xs)
+
+
+def _header_row_index(ys: list[float], header_rect: fitz.Rect | None) -> int:
+    if not header_rect or not ys:
+        return -1
+    cy = (header_rect.y0 + header_rect.y1) / 2.0
+    return row_index_from_ys(ys, cy)
+
+
+def detect_checkitems_table(
+    page: fitz.Page,
+    header_norms: list[str],
+    index_norm: str,
+    state_norms: list[str],
+) -> dict:
+    """Detect CheckItems table structure for a single page."""
+    verticals, horizontals = extract_rulings(page)
+    words = page.get_text("words") or []
+
+    header_anchor = find_lowest_header_anchor(page, header_norms, verticals, horizontals)
+    header_band = header_row_band(header_anchor) if header_anchor else None
+
+    x_left = min((x for x, _, _ in verticals), default=page.rect.x0)
+    x_right = max((x for x, _, _ in verticals), default=page.rect.x1)
+    row_lines = []
+    if horizontals and x_left < x_right:
+        start_y = header_band.y0 if header_band else 0
+        row_lines = build_table_row_lines(page, horizontals, x_left, x_right, y_start=start_y)
+    row_bounds = _row_bounds_from_lines(row_lines) if row_lines else _row_bounds_from_words(words)
+
+    table_rect = _table_rect_from_data(page, verticals, row_bounds, words)
+    xs, ys = extract_table_grid_lines(page, table_rect, verticals, horizontals)
+
+    search_clip = header_band if header_band else table_rect
+    header_cells = _find_header_cells(page, header_norms, verticals, horizontals, search_clip)
+    if header_band is None and header_cells:
+        header_band = fitz.Rect(
+            table_rect.x0,
+            min(r.y0 for r in header_cells.values()) - 2,
+            table_rect.x1,
+            max(r.y1 for r in header_cells.values()) + 2,
+        )
+
+    index_header = header_cells.get(index_norm) or header_anchor
+    index_bounds = _find_column_bounds(xs, index_header)
+    header_row_idx = _header_row_index(ys, index_header)
+
+    expected = 1
+    numbered_rows: list[int] = []
+    if index_bounds and ys:
+        for i in range(header_row_idx + 1, len(ys) - 1):
+            band = row_band_from_ys(i, ys)
+            if not band:
+                continue
+            y0, y1 = band
+            cell = fitz.Rect(index_bounds[0], y0, index_bounds[1], y1)
+            cell_text = get_cell_text(page, cell)
+            if is_pure_int(cell_text) and int(cell_text) == expected:
+                numbered_rows.append(i)
+                expected += 1
+            elif expected > 1:
+                break
+
+    state_bounds_map: dict[str, tuple[float, float]] = {}
+    for state_norm in state_norms:
+        state_header = header_cells.get(state_norm)
+        bounds = _find_column_bounds(xs, state_header)
+        if bounds:
+            state_bounds_map[state_norm] = bounds
+
+    if len(state_bounds_map) != len(state_norms):
+        if state_bounds_map:
+            x0 = min(b[0] for b in state_bounds_map.values())
+            x1 = max(b[1] for b in state_bounds_map.values())
+        else:
+            x0 = table_rect.x0
+            x1 = table_rect.x1
+        splits = split_columns_from_grid(xs, x0, x1, len(state_norms))
+        for state_norm, bounds in zip(state_norms, splits):
+            state_bounds_map.setdefault(state_norm, bounds)
+
+    return {
+        "table_bbox": table_rect,
+        "grid_xs": xs,
+        "grid_ys": ys,
+        "header_cells": header_cells,
+        "index_bounds": index_bounds,
+        "numbered_rows": numbered_rows,
+        "state_bounds": state_bounds_map,
+    }

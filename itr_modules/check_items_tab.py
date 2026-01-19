@@ -1,115 +1,24 @@
-"""CheckItems (non-Ex) test tab: locate tables and draw test boxes only."""
+"""CheckItems (non-Ex) tab: test table detection and manage manual checkmarks."""
 
 from __future__ import annotations
 
+import json
 import queue
 import threading
-import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+import tkinter as tk
 
 import fitz
 
 from itr_modules.shared.paths import OUTPUT_ROOT, ensure_output_dir, get_batch_id, open_in_file_explorer
-from itr_modules.shared.pdf_utils import (
-    build_table_row_lines,
-    extract_rulings,
-    extract_table_grid_lines,
-    find_cell_by_exact_norm,
-    find_lowest_header_anchor,
-    get_cell_text,
-    header_row_band,
-    is_pure_int,
-    norm_text,
-    row_band_from_ys,
-    row_index_from_ys,
-    snap_to_grid_x,
-    split_columns_from_grid,
-)
-
+from itr_modules.shared.pdf_utils import detect_checkitems_table, draw_checkmark, norm_text, row_band_from_ys
 
 MODULE_NAME = "check_items"
 
 
 def _parse_norm_list(text: str) -> list[str]:
     return [norm_text(t) for t in (text or "").split(",") if norm_text(t)]
-
-
-def _row_bounds_from_lines(row_lines: list[float]) -> list[tuple[float, float]]:
-    return [(y0, y1) for y0, y1 in zip(row_lines, row_lines[1:]) if y1 - y0 > 4]
-
-
-def _row_bounds_from_words(words: list[tuple]) -> list[tuple[float, float]]:
-    rows: dict[int, list[tuple[float, float]]] = {}
-    for w in words:
-        line_no = w[6]
-        rows.setdefault(line_no, []).append((w[1], w[3]))
-    bounds = []
-    for ys in rows.values():
-        y0 = min(y for y, _ in ys)
-        y1 = max(y for _, y in ys)
-        bounds.append((y0, y1))
-    bounds.sort(key=lambda r: r[0])
-    return bounds
-
-
-def _table_rect_from_data(
-    page: fitz.Page,
-    verticals: list[tuple[float, float, float]],
-    row_bounds: list[tuple[float, float]],
-    words: list[tuple],
-) -> fitz.Rect:
-    if verticals:
-        xs = [x for x, _, _ in verticals]
-        x0 = min(xs)
-        x1 = max(xs)
-    elif words:
-        x0 = min(w[0] for w in words)
-        x1 = max(w[2] for w in words)
-    else:
-        x0 = page.rect.x0
-        x1 = page.rect.x1
-
-    if row_bounds:
-        y0 = min(r[0] for r in row_bounds)
-        y1 = max(r[1] for r in row_bounds)
-    elif words:
-        y0 = min(w[1] for w in words)
-        y1 = max(w[3] for w in words)
-    else:
-        y0 = page.rect.y0
-        y1 = page.rect.y1
-
-    return fitz.Rect(x0, y0, x1, y1)
-
-
-def _find_header_cells(
-    page: fitz.Page,
-    header_norms: list[str],
-    verticals,
-    horizontals,
-    search_clip: fitz.Rect | None,
-) -> dict[str, fitz.Rect]:
-    cells: dict[str, fitz.Rect] = {}
-    for norm in header_norms:
-        rect = find_cell_by_exact_norm(page, norm, verticals, horizontals, search_clip=search_clip)
-        if rect:
-            cells[norm] = rect
-    return cells
-
-
-def _find_column_bounds(xs: list[float], header_rect: fitz.Rect | None) -> tuple[float, float] | None:
-    if not header_rect:
-        return None
-    cx = (header_rect.x0 + header_rect.x1) / 2.0
-    return snap_to_grid_x(cx, xs)
-
-
-def _header_row_index(ys: list[float], header_rect: fitz.Rect | None) -> int:
-    if not header_rect or not ys:
-        return -1
-    cy = (header_rect.y0 + header_rect.y1) / 2.0
-    return row_index_from_ys(ys, cy)
 
 
 class CheckItemsTestTab(ttk.Frame):
@@ -121,7 +30,11 @@ class CheckItemsTestTab(ttk.Frame):
         self.state_col_norms_var = tk.StringVar(value="OK,NA,PL")
         self._worker_thread: threading.Thread | None = None
         self._q: "queue.Queue[tuple]" = queue.Queue()
+        self._state_path = OUTPUT_ROOT / MODULE_NAME / ".state" / "session_state.json"
+        self.state: dict[str, dict] = {}
+        self.current_pdf: str | None = None
         self._build_ui()
+        self._load_state()
 
     def _build_ui(self):
         top = ttk.Frame(self, padding=(10, 8))
@@ -145,26 +58,75 @@ class CheckItemsTestTab(ttk.Frame):
         ).grid(row=1, column=1, sticky="w", padx=6)
 
         ttk.Label(cfg, text="INDEX_COL_NORM：").grid(row=2, column=0, sticky="e", pady=(8, 0))
-        ttk.Entry(cfg, textvariable=self.index_col_norm_var, width=50).grid(row=2, column=1, sticky="we", padx=6, pady=(8, 0))
+        ttk.Entry(cfg, textvariable=self.index_col_norm_var, width=50).grid(
+            row=2, column=1, sticky="we", padx=6, pady=(8, 0)
+        )
 
         ttk.Label(cfg, text="STATE_COL_NORMS：").grid(row=3, column=0, sticky="e", pady=(8, 0))
-        ttk.Entry(cfg, textvariable=self.state_col_norms_var, width=50).grid(row=3, column=1, sticky="we", padx=6, pady=(8, 0))
+        ttk.Entry(cfg, textvariable=self.state_col_norms_var, width=50).grid(
+            row=3, column=1, sticky="we", padx=6, pady=(8, 0)
+        )
 
         cfg.columnconfigure(1, weight=1)
 
-        list_frame = ttk.LabelFrame(self, text="已导入 PDF 列表（可多选；不选则默认全部）", padding=(8, 6))
-        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        mid = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
+        mid.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
-        self.lst_pdfs = tk.Listbox(list_frame, height=4, selectmode=tk.EXTENDED)
+        list_frame = ttk.LabelFrame(mid, text="已导入 PDF 列表（可多选；不选则默认全部）", padding=(8, 6))
+        log_frame = ttk.LabelFrame(mid, text="运行日志", padding=(8, 6))
+        mid.add(list_frame, weight=1)
+        mid.add(log_frame, weight=2)
+
+        self.lst_pdfs = tk.Listbox(list_frame, height=6, selectmode=tk.EXTENDED)
         self.lst_pdfs.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sbx = ttk.Scrollbar(list_frame, orient="vertical", command=self.lst_pdfs.yview)
         sbx.pack(side=tk.RIGHT, fill=tk.Y)
         self.lst_pdfs.configure(yscrollcommand=sbx.set)
         self.lst_pdfs.bind("<<ListboxSelect>>", lambda _e: self._update_status())
 
-        ttk.Label(self, text="运行日志：").pack(anchor="w", padx=10)
-        self.log = tk.Text(self, height=8)
-        self.log.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        self.log = tk.Text(log_frame, height=10)
+        self.log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        log_sb = ttk.Scrollbar(log_frame, orient="vertical", command=self.log.yview)
+        log_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log.configure(yscrollcommand=log_sb.set)
+
+        bottom = ttk.LabelFrame(self, text="打勾操作", padding=(8, 6))
+        bottom.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        bottom_paned = ttk.Panedwindow(bottom, orient=tk.HORIZONTAL)
+        bottom_paned.pack(fill=tk.BOTH, expand=True)
+
+        tag_frame = ttk.Frame(bottom_paned)
+        grid_frame = ttk.Frame(bottom_paned)
+        bottom_paned.add(tag_frame, weight=1)
+        bottom_paned.add(grid_frame, weight=3)
+
+        ttk.Label(tag_frame, text="Tag 列表：").pack(anchor="w")
+        self.tag_list = tk.Listbox(tag_frame, height=8)
+        self.tag_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tag_sb = ttk.Scrollbar(tag_frame, orient="vertical", command=self.tag_list.yview)
+        tag_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tag_list.configure(yscrollcommand=tag_sb.set)
+        self.tag_list.bind("<<ListboxSelect>>", self._on_tag_select)
+
+        grid_top = ttk.Frame(grid_frame)
+        grid_top.pack(fill=tk.X)
+        ttk.Button(grid_top, text="导出打勾 PDF", command=self.export_filled).pack(side=tk.RIGHT)
+
+        self.mark_tree = ttk.Treeview(grid_frame, columns=("OK", "NA", "PL"), show="tree headings", height=10)
+        self.mark_tree.heading("#0", text="Item")
+        self.mark_tree.heading("OK", text="OK")
+        self.mark_tree.heading("NA", text="NA")
+        self.mark_tree.heading("PL", text="PL")
+        self.mark_tree.column("#0", width=60, anchor="center")
+        self.mark_tree.column("OK", width=80, anchor="center")
+        self.mark_tree.column("NA", width=80, anchor="center")
+        self.mark_tree.column("PL", width=80, anchor="center")
+        self.mark_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        mark_sb = ttk.Scrollbar(grid_frame, orient="vertical", command=self.mark_tree.yview)
+        mark_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.mark_tree.configure(yscrollcommand=mark_sb.set)
+        self.mark_tree.bind("<Button-1>", self._on_mark_click)
 
     def _log(self, msg: str):
         self.log.insert(tk.END, msg + "\n")
@@ -188,6 +150,59 @@ class CheckItemsTestTab(ttk.Frame):
                 pass
         return out
 
+    def _state_file(self) -> Path:
+        self._state_path.parent.mkdir(parents=True, exist_ok=True)
+        return self._state_path
+
+    def _load_state(self) -> None:
+        path = self._state_file()
+        if not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if isinstance(payload, dict):
+            self.state = payload
+
+    def _save_state(self) -> None:
+        path = self._state_file()
+        serializable = {}
+        for pdf_path, entry in self.state.items():
+            if not isinstance(entry, dict):
+                continue
+            marks = entry.get("marks", {})
+            serializable[pdf_path] = {
+                "item_count": int(entry.get("item_count", 0)),
+                "marks": {str(k): v for k, v in (marks or {}).items()},
+            }
+        path.write_text(json.dumps(serializable, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _ensure_state_for_pdf(self, pdf_path: str) -> None:
+        entry = self.state.setdefault(pdf_path, {"item_count": 0, "marks": {}})
+        if entry.get("item_count", 0) > 0:
+            return
+
+        header_norms = _parse_norm_list(self.header_norms_var.get())
+        index_norm = norm_text(self.index_col_norm_var.get())
+        state_norms = _parse_norm_list(self.state_col_norms_var.get())
+        if not header_norms or not index_norm or not state_norms:
+            return
+
+        try:
+            doc = fitz.open(pdf_path)
+        except Exception:
+            return
+
+        for page in doc:
+            info = detect_checkitems_table(page, header_norms, index_norm, state_norms)
+            row_count = len(info.get("numbered_rows") or [])
+            if row_count:
+                entry["item_count"] = row_count
+                break
+        doc.close()
+        self._save_state()
+
     def pick_pdfs(self):
         paths = filedialog.askopenfilenames(title="选择一个或多个 PDF", filetypes=[("PDF", "*.pdf")])
         if not paths:
@@ -200,8 +215,11 @@ class CheckItemsTestTab(ttk.Frame):
                 new_list.append(p)
         self.pdf_paths = list(new_list)
         self.lst_pdfs.delete(0, tk.END)
+        self.tag_list.delete(0, tk.END)
         for p in self.pdf_paths:
-            self.lst_pdfs.insert(tk.END, Path(p).name)
+            name = Path(p).name
+            self.lst_pdfs.insert(tk.END, name)
+            self.tag_list.insert(tk.END, name)
         self._update_status()
         self._log(f"已导入 PDF：{len(self.pdf_paths)} 个")
 
@@ -212,6 +230,55 @@ class CheckItemsTestTab(ttk.Frame):
         path = OUTPUT_ROOT / MODULE_NAME
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    def _on_tag_select(self, _event=None) -> None:
+        sel = self.tag_list.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        if idx >= len(self.pdf_paths):
+            return
+        self.current_pdf = self.pdf_paths[idx]
+        self._ensure_state_for_pdf(self.current_pdf)
+        self._render_marks()
+
+    def _render_marks(self) -> None:
+        self.mark_tree.delete(*self.mark_tree.get_children())
+        if not self.current_pdf:
+            return
+        entry = self.state.get(self.current_pdf, {})
+        item_count = int(entry.get("item_count", 0))
+        marks = entry.get("marks", {}) or {}
+        for i in range(1, item_count + 1):
+            mark = marks.get(str(i), "")
+            values = (
+                "✓" if mark == "OK" else "",
+                "✓" if mark == "NA" else "",
+                "✓" if mark == "PL" else "",
+            )
+            self.mark_tree.insert("", tk.END, iid=str(i), text=str(i), values=values)
+
+    def _on_mark_click(self, event) -> None:
+        if not self.current_pdf:
+            return
+        row_id = self.mark_tree.identify_row(event.y)
+        col_id = self.mark_tree.identify_column(event.x)
+        if not row_id or col_id == "#0":
+            return
+        col_map = {"#1": "OK", "#2": "NA", "#3": "PL"}
+        col = col_map.get(col_id)
+        if not col:
+            return
+
+        entry = self.state.setdefault(self.current_pdf, {"item_count": 0, "marks": {}})
+        marks = entry.setdefault("marks", {})
+        current = marks.get(str(row_id), "")
+        if current == col:
+            marks[str(row_id)] = ""
+        else:
+            marks[str(row_id)] = col
+        self._save_state()
+        self._render_marks()
 
     def run_test(self):
         if not self.pdf_paths:
@@ -270,59 +337,20 @@ class CheckItemsTestTab(ttk.Frame):
             stem = Path(pdf_path).stem
             out_pdf = out_dir / f"{stem}_test.pdf"
             doc = fitz.open(pdf_path)
+            detected_rows = 0
 
             for page in doc:
-                verticals, horizontals = extract_rulings(page)
-                words = page.get_text("words") or []
+                info = detect_checkitems_table(page, header_norms, index_norm, state_norms)
+                header_cells = info.get("header_cells", {})
+                index_bounds = info.get("index_bounds")
+                ys = info.get("grid_ys", [])
+                numbered_rows = info.get("numbered_rows", [])
+                state_bounds = info.get("state_bounds", {})
 
-                header_anchor = find_lowest_header_anchor(page, header_norms, verticals, horizontals)
-                header_band = header_row_band(header_anchor) if header_anchor else None
-
-                x_left = min((x for x, _, _ in verticals), default=page.rect.x0)
-                x_right = max((x for x, _, _ in verticals), default=page.rect.x1)
-
-                row_lines = []
-                if horizontals and x_left < x_right:
-                    start_y = header_band.y0 if header_band else 0
-                    row_lines = build_table_row_lines(page, horizontals, x_left, x_right, y_start=start_y)
-                row_bounds = _row_bounds_from_lines(row_lines) if row_lines else _row_bounds_from_words(words)
-
-                table_rect = _table_rect_from_data(page, verticals, row_bounds, words)
-                xs, ys = extract_table_grid_lines(page, table_rect, verticals, horizontals)
-                search_clip = header_band if header_band else table_rect
-                header_cells = _find_header_cells(page, header_norms, verticals, horizontals, search_clip)
-                if header_band is None and header_cells:
-                    header_band = fitz.Rect(
-                        table_rect.x0,
-                        min(r.y0 for r in header_cells.values()) - 2,
-                        table_rect.x1,
-                        max(r.y1 for r in header_cells.values()) + 2,
-                    )
-
-                index_header = header_cells.get(index_norm) or header_anchor
-                index_bounds = _find_column_bounds(xs, index_header)
-                if not index_bounds:
+                if not (index_bounds and ys and numbered_rows):
                     continue
 
-                header_row_idx = _header_row_index(ys, index_header)
-
-                expected = 1
-                numbered_rows: list[int] = []
-                for i in range(header_row_idx + 1, len(ys) - 1):
-                    band = row_band_from_ys(i, ys)
-                    if not band:
-                        continue
-                    y0, y1 = band
-                    cell = fitz.Rect(index_bounds[0], y0, index_bounds[1], y1)
-                    cell_text = get_cell_text(page, cell)
-                    if is_pure_int(cell_text) and int(cell_text) == expected:
-                        numbered_rows.append(i)
-                        expected += 1
-                    elif expected > 1:
-                        break
-
-                if not numbered_rows:
-                    continue
+                detected_rows = max(detected_rows, len(numbered_rows))
 
                 for rect in header_cells.values():
                     page.draw_rect(rect, color=(0, 0, 1), width=1.2)
@@ -334,27 +362,9 @@ class CheckItemsTestTab(ttk.Frame):
                     y0, y1 = band
                     page.draw_rect(fitz.Rect(index_bounds[0], y0, index_bounds[1], y1), color=(0, 0, 1), width=1.2)
 
-                state_bounds_map: dict[str, tuple[float, float]] = {}
                 for state_norm in state_norms:
-                    state_header = header_cells.get(state_norm)
-                    bounds = _find_column_bounds(xs, state_header)
-                    if bounds:
-                        state_bounds_map[state_norm] = bounds
-
-                if len(state_bounds_map) != len(state_norms):
-                    if state_bounds_map:
-                        x0 = min(b[0] for b in state_bounds_map.values())
-                        x1 = max(b[1] for b in state_bounds_map.values())
-                    else:
-                        x0 = table_rect.x0
-                        x1 = table_rect.x1
-                    splits = split_columns_from_grid(xs, x0, x1, len(state_norms))
-                    for state_norm, bounds in zip(state_norms, splits):
-                        state_bounds_map.setdefault(state_norm, bounds)
-
-                for state_norm in state_norms:
-                    state_bounds = state_bounds_map.get(state_norm)
-                    if not state_bounds:
+                    state_bounds_rect = state_bounds.get(state_norm)
+                    if not state_bounds_rect:
                         continue
                     for row_idx in numbered_rows:
                         band = row_band_from_ys(row_idx, ys)
@@ -362,13 +372,69 @@ class CheckItemsTestTab(ttk.Frame):
                             continue
                         y0, y1 = band
                         page.draw_rect(
-                            fitz.Rect(state_bounds[0], y0, state_bounds[1], y1),
+                            fitz.Rect(state_bounds_rect[0], y0, state_bounds_rect[1], y1),
                             color=(0, 0, 1),
                             width=1.2,
                         )
 
             doc.save(out_pdf)
             doc.close()
+            if detected_rows:
+                entry = self.state.setdefault(pdf_path, {"item_count": 0, "marks": {}})
+                entry["item_count"] = max(int(entry.get("item_count", 0)), detected_rows)
+                self._save_state()
             self._q.put(("log", f"[Test] 已生成：{out_pdf}"))
 
         self._q.put(("done", out_dir))
+
+    def export_filled(self) -> None:
+        if not self.pdf_paths:
+            messagebox.showwarning("提示", "请先批量导入 PDF")
+            return
+
+        header_norms = _parse_norm_list(self.header_norms_var.get())
+        index_norm = norm_text(self.index_col_norm_var.get())
+        state_norms = _parse_norm_list(self.state_col_norms_var.get())
+        if not header_norms or not index_norm or not state_norms:
+            messagebox.showwarning("提示", "请检查 HEADER_NORMS / INDEX_COL_NORM / STATE_COL_NORMS 配置")
+            return
+
+        batch_id = get_batch_id()
+        out_dir = ensure_output_dir(MODULE_NAME, "filled", batch_id)
+        for pdf_path in self.pdf_paths:
+            marks = (self.state.get(pdf_path, {}) or {}).get("marks", {}) or {}
+            if not marks:
+                continue
+            try:
+                doc = fitz.open(pdf_path)
+            except Exception:
+                continue
+
+            for page in doc:
+                info = detect_checkitems_table(page, header_norms, index_norm, state_norms)
+                ys = info.get("grid_ys", [])
+                numbered_rows = info.get("numbered_rows", [])
+                state_bounds = info.get("state_bounds", {})
+                if not (ys and numbered_rows and state_bounds):
+                    continue
+
+                for idx, row_idx in enumerate(numbered_rows, start=1):
+                    mark = marks.get(str(idx), "")
+                    if not mark:
+                        continue
+                    bounds = state_bounds.get(mark)
+                    if not bounds:
+                        continue
+                    band = row_band_from_ys(row_idx, ys)
+                    if not band:
+                        continue
+                    y0, y1 = band
+                    rect = fitz.Rect(bounds[0], y0, bounds[1], y1)
+                    draw_checkmark(page, rect, width=1.6)
+
+            out_pdf = out_dir / f"{Path(pdf_path).stem}_filled.pdf"
+            doc.save(out_pdf)
+            doc.close()
+            self._log(f"[导出] {out_pdf}")
+
+        messagebox.showinfo("完成", f"已导出到：\n{out_dir}")
