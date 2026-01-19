@@ -616,6 +616,32 @@ def _scan_header_cells_by_grid(
     return cells
 
 
+def _detect_header_row_index(
+    page: fitz.Page,
+    ys: list[float],
+    header_norms: list[str],
+    header_anchor: fitz.Rect | None,
+) -> int:
+    if header_anchor:
+        idx = _header_row_index(ys, header_anchor)
+        if idx >= 0:
+            return idx
+    if not ys:
+        return -1
+    header_set = {norm_text(h) for h in header_norms if norm_text(h)}
+    words = page.get_text("words") or []
+    counts: dict[int, int] = {}
+    for x0, y0, x1, y1, w, *_ in words:
+        if norm_text(w) in header_set:
+            cy = (y0 + y1) / 2.0
+            row_idx = row_index_from_ys(ys, cy)
+            if row_idx >= 0:
+                counts[row_idx] = counts.get(row_idx, 0) + 1
+    if not counts:
+        return -1
+    return max(counts.items(), key=lambda kv: kv[1])[0]
+
+
 def _find_column_bounds(xs: list[float], header_rect: fitz.Rect | None) -> tuple[float, float] | None:
     if not header_rect:
         return None
@@ -664,17 +690,15 @@ def detect_checkitems_table(
             max(r.y1 for r in header_cells.values()) + 2,
         )
 
-    index_header = header_cells.get(index_norm) or header_anchor
-    header_row_idx = _header_row_index(ys, index_header)
+    header_row_idx = _detect_header_row_index(page, ys, header_norms, header_anchor)
     header_band_ys = row_band_from_ys(header_row_idx, ys) if header_row_idx >= 0 else None
     if not header_cells and header_band_ys:
         header_cells.update(_scan_header_cells_by_grid(page, xs, header_band_ys, header_norms))
 
-    index_header = header_cells.get(index_norm) or header_anchor
+    index_header = header_cells.get(index_norm)
     index_bounds = _find_column_bounds(xs, index_header)
-    if header_row_idx < 0 and index_header:
-        header_row_idx = _header_row_index(ys, index_header)
-        header_band_ys = row_band_from_ys(header_row_idx, ys) if header_row_idx >= 0 else None
+    if index_bounds is None and header_anchor:
+        index_bounds = _find_column_bounds(xs, header_anchor)
 
     expected = 1
     numbered_rows: list[int] = []
@@ -713,11 +737,16 @@ def detect_checkitems_table(
         for state_norm, bounds in zip(state_norms, splits):
             state_bounds_map.setdefault(state_norm, bounds)
 
+    header_texts = {}
+    for norm, rect in header_cells.items():
+        header_texts[norm] = get_cell_text(page, rect)
+
     return {
         "table_bbox": table_rect,
         "grid_xs": xs,
         "grid_ys": ys,
         "header_cells": header_cells,
+        "header_texts": header_texts,
         "index_bounds": index_bounds,
         "numbered_rows": numbered_rows,
         "state_bounds": state_bounds_map,

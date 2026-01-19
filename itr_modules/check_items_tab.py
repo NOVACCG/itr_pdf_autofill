@@ -68,51 +68,45 @@ class CheckItemsTestTab(ttk.Frame):
         ttk.Button(top, text="解析", command=self.parse_pdfs).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(top, text="Test（生成框图 PDF）", command=self.run_test).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(top, text="打开测试输出", command=self.open_test_folder).pack(side=tk.LEFT, padx=(0, 8))
-
-        self.status = ttk.Label(self, text="已导入PDF：0（可多选） | 选中：0", padding=(10, 0))
-        self.status.pack(fill=tk.X)
+        self.status = ttk.Label(top, text="已导入PDF：0（可多选） | 选中：0")
+        self.status.pack(side=tk.LEFT, padx=(12, 0))
 
         cfg = ttk.LabelFrame(self, text="测试配置", padding=10)
         cfg.pack(fill=tk.X, padx=10, pady=(0, 10))
 
         ttk.Label(cfg, text="HEADER_NORMS：").grid(row=0, column=0, sticky="e")
-        ttk.Entry(cfg, textvariable=self.header_norms_var, width=50).grid(row=0, column=1, sticky="we", padx=6)
-        ttk.Label(
-            cfg,
-            text="多个归一值用英文逗号分隔，自动去空格，大小写不敏感",
-        ).grid(row=1, column=1, sticky="w", padx=6)
+        ttk.Entry(cfg, textvariable=self.header_norms_var, width=40).grid(row=0, column=1, sticky="we", padx=6)
 
-        ttk.Label(cfg, text="INDEX_COL_NORM：").grid(row=2, column=0, sticky="e", pady=(8, 0))
-        ttk.Entry(cfg, textvariable=self.index_col_norm_var, width=50).grid(
+        ttk.Label(cfg, text="INDEX_COL_NORM：").grid(row=1, column=0, sticky="e", pady=(8, 0))
+        ttk.Entry(cfg, textvariable=self.index_col_norm_var, width=40).grid(
+            row=1, column=1, sticky="we", padx=6, pady=(8, 0)
+        )
+
+        ttk.Label(cfg, text="STATE_COL_NORMS：").grid(row=2, column=0, sticky="e", pady=(8, 0))
+        ttk.Entry(cfg, textvariable=self.state_col_norms_var, width=40).grid(
             row=2, column=1, sticky="we", padx=6, pady=(8, 0)
         )
 
-        ttk.Label(cfg, text="STATE_COL_NORMS：").grid(row=3, column=0, sticky="e", pady=(8, 0))
-        ttk.Entry(cfg, textvariable=self.state_col_norms_var, width=50).grid(
-            row=3, column=1, sticky="we", padx=6, pady=(8, 0)
+        ttk.Label(cfg, text="Page1 识别正则：").grid(row=0, column=2, sticky="e")
+        ttk.Entry(cfg, textvariable=self.page1_regex_var, width=40).grid(row=0, column=3, sticky="we", padx=6)
+
+        ttk.Label(cfg, text="每个 ITR 页数：").grid(row=1, column=2, sticky="e", pady=(8, 0))
+        ttk.Entry(cfg, textvariable=self.pages_per_itr_var, width=40).grid(
+            row=1, column=3, sticky="we", padx=6, pady=(8, 0)
         )
 
-        ttk.Label(cfg, text="Page1 识别正则：").grid(row=4, column=0, sticky="e", pady=(8, 0))
-        ttk.Entry(cfg, textvariable=self.page1_regex_var, width=50).grid(
-            row=4, column=1, sticky="we", padx=6, pady=(8, 0)
+        ttk.Label(cfg, text="MatchKey 名称：").grid(row=2, column=2, sticky="e", pady=(8, 0))
+        ttk.Entry(cfg, textvariable=self.matchkey_name_var, width=40).grid(
+            row=2, column=3, sticky="we", padx=6, pady=(8, 0)
         )
 
-        ttk.Label(cfg, text="每个 ITR 页数（手动兜底）：").grid(row=5, column=0, sticky="e", pady=(8, 0))
-        ttk.Entry(cfg, textvariable=self.pages_per_itr_var, width=50).grid(
-            row=5, column=1, sticky="we", padx=6, pady=(8, 0)
-        )
-
-        ttk.Label(cfg, text="MatchKey 名称：").grid(row=6, column=0, sticky="e", pady=(8, 0))
-        ttk.Entry(cfg, textvariable=self.matchkey_name_var, width=50).grid(
-            row=6, column=1, sticky="we", padx=6, pady=(8, 0)
-        )
-
-        ttk.Label(cfg, text="Tag 正则：").grid(row=7, column=0, sticky="e", pady=(8, 0))
-        ttk.Entry(cfg, textvariable=self.tag_regex_var, width=50).grid(
-            row=7, column=1, sticky="we", padx=6, pady=(8, 0)
+        ttk.Label(cfg, text="Tag 正则：").grid(row=3, column=0, sticky="e", pady=(8, 0))
+        ttk.Entry(cfg, textvariable=self.tag_regex_var, width=40).grid(
+            row=3, column=1, columnspan=3, sticky="we", padx=6, pady=(8, 0)
         )
 
         cfg.columnconfigure(1, weight=1)
+        cfg.columnconfigure(3, weight=1)
 
         mid = ttk.Panedwindow(self, orient=tk.HORIZONTAL)
         mid.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
@@ -153,19 +147,10 @@ class CheckItemsTestTab(ttk.Frame):
         self.tag_list.configure(yscrollcommand=tag_sb.set)
         self.tag_list.bind("<<ListboxSelect>>", self._on_tag_select)
 
-        itr_frame = ttk.LabelFrame(grid_frame, text="ITR 列表", padding=(6, 4))
-        itr_frame.pack(fill=tk.X)
-        self.itr_list = tk.Listbox(itr_frame, height=4)
-        self.itr_list.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        itr_sb = ttk.Scrollbar(itr_frame, orient="vertical", command=self.itr_list.yview)
-        itr_sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.itr_list.configure(yscrollcommand=itr_sb.set)
-        self.itr_list.bind("<<ListboxSelect>>", self._on_itr_select)
-
         tree_frame = ttk.Frame(grid_frame)
         tree_frame.pack(fill=tk.BOTH, expand=True)
 
-        self.mark_tree = ttk.Treeview(tree_frame, columns=("OK", "NA", "PL"), show="tree headings", height=10)
+        self.mark_tree = ttk.Treeview(tree_frame, columns=("OK", "NA", "PL"), show="tree headings", height=12)
         self.mark_tree.heading("#0", text="Item")
         self.mark_tree.heading("OK", text="OK")
         self.mark_tree.heading("NA", text="NA")
@@ -185,10 +170,8 @@ class CheckItemsTestTab(ttk.Frame):
     def _set_parsed_ready(self, ready: bool) -> None:
         state = tk.NORMAL if ready else tk.DISABLED
         self.tag_list.configure(state=state)
-        self.itr_list.configure(state=state)
         if not ready:
             self.tag_list.delete(0, tk.END)
-            self.itr_list.delete(0, tk.END)
             self.mark_tree.delete(*self.mark_tree.get_children())
             self.current_tag = None
             self.current_itr_index = None
@@ -339,7 +322,7 @@ class CheckItemsTestTab(ttk.Frame):
                 return m.group(1).strip()
         return ""
 
-    def _detect_item_count(self, doc: fitz.Document, segment: tuple[int, int]) -> int:
+    def _detect_table_info(self, doc: fitz.Document, segment: tuple[int, int]) -> tuple[int, dict]:
         header_norms = _parse_norm_list(self.header_norms_var.get())
         index_norm = norm_text(self.index_col_norm_var.get())
         state_norms = _parse_norm_list(self.state_col_norms_var.get())
@@ -347,8 +330,8 @@ class CheckItemsTestTab(ttk.Frame):
             info = detect_checkitems_table(doc[page_index], header_norms, index_norm, state_norms)
             count = len(info.get("numbered_rows") or [])
             if count:
-                return count
-        return 0
+                return count, info
+        return 0, {}
 
     def parse_pdfs(self) -> None:
         if not self.pdf_paths:
@@ -398,7 +381,7 @@ class CheckItemsTestTab(ttk.Frame):
                         f"[解析] {Path(pdf_path).name} 第{itr_idx}套未找到{matchkey_name}，使用 {tag_id}"
                     )
 
-                item_count = self._detect_item_count(doc, segment)
+                item_count, table_info = self._detect_table_info(doc, segment)
                 if item_count == 0:
                     self._log(f"[解析] {Path(pdf_path).name} 第{itr_idx}套未识别到序号行。")
 
@@ -407,6 +390,8 @@ class CheckItemsTestTab(ttk.Frame):
                     "itr_index": itr_idx,
                     "segment": segment,
                     "item_count": item_count,
+                    "table_info": table_info,
+                    "header_texts": table_info.get("header_texts", {}) if table_info else {},
                 }
                 self.parsed_tags.setdefault(tag_id, []).append(entry)
 
@@ -431,23 +416,8 @@ class CheckItemsTestTab(ttk.Frame):
         if not tag:
             return
         self.current_tag = tag
-        self.current_itr_index = None
-        self.itr_list.delete(0, tk.END)
+        self.current_itr_index = 1
         self.mark_tree.delete(*self.mark_tree.get_children())
-
-        itr_entries = self.parsed_tags.get(tag, [])
-        for itr_idx, entry in enumerate(itr_entries, start=1):
-            start, end = entry["segment"]
-            name = f"ITR-{itr_idx} (p{start + 1}-{end + 1})"
-            self.itr_list.insert(tk.END, name)
-
-    def _on_itr_select(self, _event=None) -> None:
-        if self.current_tag is None:
-            return
-        if not self.itr_list.curselection():
-            return
-        itr_idx = self.itr_list.curselection()[0] + 1
-        self.current_itr_index = itr_idx
         self._render_marks()
 
     def _render_marks(self) -> None:
@@ -457,7 +427,13 @@ class CheckItemsTestTab(ttk.Frame):
         itr_entries = self.parsed_tags.get(self.current_tag, [])
         if self.current_itr_index - 1 >= len(itr_entries):
             return
-        item_count = int(itr_entries[self.current_itr_index - 1].get("item_count", 0))
+        entry = itr_entries[self.current_itr_index - 1]
+        item_count = int(entry.get("item_count", 0))
+        header_texts = entry.get("header_texts", {})
+        self.mark_tree.heading("#0", text=header_texts.get("ITEM", "Item") or "Item")
+        self.mark_tree.heading("OK", text=header_texts.get("OK", "OK") or "OK")
+        self.mark_tree.heading("NA", text=header_texts.get("NA", "NA") or "NA")
+        self.mark_tree.heading("PL", text=header_texts.get("PL", "PL") or "PL")
         marks = self.selections.get(self.current_tag, {}).get(self.current_itr_index, {})
         for i in range(1, item_count + 1):
             mark = marks.get(i, "")
@@ -517,7 +493,15 @@ class CheckItemsTestTab(ttk.Frame):
 
         self._worker_thread = threading.Thread(
             target=self._test_worker,
-            args=(targets, header_norms, index_norm, state_norms, out_dir),
+            args=(
+                targets,
+                header_norms,
+                index_norm,
+                state_norms,
+                self.matchkey_name_var.get().strip() or "TAG",
+                self.tag_regex_var.get().strip() or DEFAULT_TAG_REGEX,
+                out_dir,
+            ),
             daemon=True,
         )
         self._worker_thread.start()
@@ -540,12 +524,30 @@ class CheckItemsTestTab(ttk.Frame):
         if self._worker_thread and self._worker_thread.is_alive():
             self.after(120, self._poll_queue)
 
+    def _draw_tag_boxes(self, page: fitz.Page, matchkey_name: str, tag_regex: str) -> None:
+        if matchkey_name:
+            for rect in page.search_for(matchkey_name):
+                page.draw_rect(rect, color=(0, 0.6, 0), width=1.2)
+        try:
+            rx = re.compile(tag_regex, re.IGNORECASE)
+        except re.error:
+            rx = re.compile(DEFAULT_TAG_REGEX, re.IGNORECASE)
+        text = page.get_text("text") or ""
+        match = rx.search(text)
+        if match:
+            value = match.group(1).strip()
+            if value:
+                for rect in page.search_for(value):
+                    page.draw_rect(rect, color=(0, 0.6, 0), width=1.2)
+
     def _test_worker(
         self,
         targets: list[str],
         header_norms: list[str],
         index_norm: str,
         state_norms: list[str],
+        matchkey_name: str,
+        tag_regex: str,
         out_dir: Path,
     ):
         for pdf_path in targets:
@@ -560,8 +562,30 @@ class CheckItemsTestTab(ttk.Frame):
                 ys = info.get("grid_ys", [])
                 numbered_rows = info.get("numbered_rows", [])
                 state_bounds = info.get("state_bounds", {})
+                xs = info.get("grid_xs", [])
+
+                def _col_bounds(rect: fitz.Rect | None) -> tuple[float, float] | None:
+                    if not rect or not xs or len(xs) < 2:
+                        return None
+                    cx = (rect.x0 + rect.x1) / 2.0
+                    left = None
+                    right = None
+                    for x in xs:
+                        if x <= cx:
+                            left = x
+                        if x >= cx and right is None:
+                            right = x
+                    if left is None or right is None:
+                        return None
+                    if left == right:
+                        for i in range(len(xs) - 1):
+                            if xs[i] <= cx <= xs[i + 1]:
+                                return xs[i], xs[i + 1]
+                        return None
+                    return left, right
 
                 if not (index_bounds and ys and numbered_rows):
+                    self._draw_tag_boxes(page, matchkey_name, tag_regex)
                     continue
 
                 for rect in header_cells.values():
@@ -573,6 +597,19 @@ class CheckItemsTestTab(ttk.Frame):
                         continue
                     y0, y1 = band
                     page.draw_rect(fitz.Rect(index_bounds[0], y0, index_bounds[1], y1), color=(0, 0, 1), width=1.2)
+
+                desc_bounds = _col_bounds(header_cells.get("DESCRIPTION"))
+                if desc_bounds:
+                    for row_idx in numbered_rows:
+                        band = row_band_from_ys(row_idx, ys)
+                        if not band:
+                            continue
+                        y0, y1 = band
+                        page.draw_rect(
+                            fitz.Rect(desc_bounds[0], y0, desc_bounds[1], y1),
+                            color=(0, 0, 1),
+                            width=1.2,
+                        )
 
                 for state_norm in state_norms:
                     state_bounds_rect = state_bounds.get(state_norm)
@@ -588,6 +625,8 @@ class CheckItemsTestTab(ttk.Frame):
                             color=(0, 0, 1),
                             width=1.2,
                         )
+
+                self._draw_tag_boxes(page, matchkey_name, tag_regex)
 
             doc.save(out_pdf)
             doc.close()
