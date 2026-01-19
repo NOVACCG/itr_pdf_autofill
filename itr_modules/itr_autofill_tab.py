@@ -36,13 +36,11 @@ APP_VERSION = "V1.0.3"
 
 from itr_modules.shared.paths import BASE_DIR, ensure_output_dir, ensure_report_dir, get_batch_id, open_in_file_explorer
 from itr_modules.shared.pdf_utils import (
-    extract_candidates_in_cell_text,
-    extract_rulings,
-    find_cell_by_exact_norm,
-    find_adjacent_cell_with_tolerance,
+    extract_tag_by_cell_adjacency,
+    extract_value_by_regex,
     fit_text_to_box,
     norm_text,
-    template_fingerprint,
+    normalize_cell_text,
 )
 
 PRESETS_DIR = os.path.join(BASE_DIR, "presets")
@@ -59,8 +57,9 @@ os.makedirs(OUTPUT_FILLED_ROOT, exist_ok=True)
 ensure_report_dir(MODULE_NAME, get_batch_id())
 
 DEFAULT_PAGE1_MARK_RE = re.compile(r"Page\s*1\s*of\s*(\d+)", re.IGNORECASE)
-DEFAULT_TAG_RE = re.compile(r"TAG\s*NO\.\s*:\s*([A-Za-z0-9\-\._/]+)", re.IGNORECASE)
-DEFAULT_VALUE_REGEX = r"([A-Za-z0-9\-\._/]+)"
+DEFAULT_TAG_PATTERN = r"TAG\s*NO\.\s*:\s*([A-Za-z0-9\-\._/]+)"
+DEFAULT_TAG_RE = re.compile(DEFAULT_TAG_PATTERN, re.IGNORECASE)
+DEFAULT_VALUE_REGEX = DEFAULT_TAG_PATTERN
 TAG_DIRECTION_OPTIONS = ["RIGHT", "LEFT", "DOWN", "UP"]
 
 SIDE_OPTIONS = ["", "LEFT", "RIGHT"]
@@ -922,7 +921,7 @@ class ITRAutofillTab(ttk.Frame):
 
         mk1 = ttk.Frame(mk)
         mk1.pack(fill="x", padx=10, pady=6)
-        ttk.Label(mk1, text="Key 归一值").pack(side="left")
+        ttk.Label(mk1, text="Key 归一值(锚点)").pack(side="left")
         self.ent_key_name = ttk.Entry(mk1, width=20)
         self.ent_key_name.pack(side="left", padx=8)
 
@@ -1630,48 +1629,38 @@ class ITRAutofillTab(ttk.Frame):
         direction = (match_cfg.get("tag_direction", "RIGHT") or "RIGHT").upper()
         page1 = doc[start_page - 1]
 
-        print(f"Key 名称={key_name}（仅显示用，不参与定位）")
-        print(f"方法A：使用 key_norm={key_norm} 定位 matchkey 单元格")
-        key_cell = find_cell_by_exact_norm(page1, key_norm, *extract_rulings(page1))
-        if not key_cell:
-            print(f"未找到 key_norm={key_norm} 的单元格（严格等值匹配）")
+        print(f"Key 归一值(锚点)={key_norm}")
+        value_normed, debug = extract_tag_by_cell_adjacency(page1, key_norm, direction)
+        cell_norm = debug.get("cell_norm", "")
+        cell_rect = debug.get("match_cell", None)
+        if cell_norm and cell_rect:
+            print(f"命中 key_norm={key_norm} cell_norm={cell_norm} cell_rect={cell_rect}")
+        print(
+            "debug key_bbox={key_bbox} divider_x={divider_x} value_cell_before_fallback={value_cell} "
+            "fallback_words_count={fallback_words_count} raw_preview={raw_preview}".format(
+                key_bbox=debug.get("key_bbox"),
+                divider_x=debug.get("divider_x"),
+                value_cell=debug.get("value_cell_before_fallback"),
+                fallback_words_count=debug.get("fallback_words_count"),
+                raw_preview=debug.get("raw_preview"),
+            )
+        )
+        if not value_normed:
+            if debug.get("error") == "match_cell_not_found":
+                print(f"未找到 key_norm={key_norm} 的单元格（严格等值匹配）")
+            else:
+                print(f"找到 key_norm 单元格，但 direction={direction} 的相邻单元格不存在/为空")
             return "", "missing"
 
-        adj_rect, adj_debug = find_adjacent_cell_with_tolerance(page1, key_cell, direction)
-        if not adj_rect:
-            print(f"找到 key_norm 单元格，但 direction={direction} 的相邻单元格不存在")
-            return "", "missing"
-
-        value_text = page1.get_text("text", clip=adj_rect) or ""
-        value_text = value_text.strip()
-        if not value_text:
-            print("相邻格文本为空")
-            return "", "missing"
-
+        value_raw = normalize_cell_text(debug.get("raw") or value_normed)
         value_regex = (match_cfg.get("pdf_extract_regex", "") or "").strip() or DEFAULT_VALUE_REGEX
         try:
-            candidates = extract_candidates_in_cell_text(value_text, value_regex)
+            tag_value = extract_value_by_regex(value_raw, value_regex)
         except re.error as exc:
-            print(f"正则无效，无法扫描：{exc}")
+            print(f"正则无效，无法截取：{exc}")
             return "", "missing"
-        if not candidates:
-            print("正则未命中")
-            return "", "missing"
-
-        preset_name = preset.get("preset_name", "")
-        fingerprint = template_fingerprint(preset_name, key_norm, direction, value_regex)
-        remembered = self.tag_choice_memory.get(fingerprint, "")
-        if remembered and remembered in candidates:
-            tag_value = remembered
-        elif len(candidates) == 1:
-            tag_value = candidates[0]
-        else:
-            tag_value, remember = self._thread_tag_candidate_chooser(os.path.basename(pdf_path), candidates)
-            if remember and tag_value:
-                self.tag_choice_memory[fingerprint] = tag_value
-                save_json_safe(TAG_CHOICE_MEMORY_PATH, self.tag_choice_memory)
-
         if not tag_value:
+            print(f"value_cell 有文本，但 regex 截取失败；value_raw={value_raw}; regex={value_regex}")
             return "", "missing"
 
         tag_value = norm_key_value(tag_value)

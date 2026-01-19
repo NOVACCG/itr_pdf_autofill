@@ -338,6 +338,9 @@ def extract_tag_by_cell_adjacency(
         debug["error"] = "match_cell_not_found"
         return None, debug
 
+    label_text = get_cell_text(page, match_cell)
+    debug["cell_norm"] = norm_text(label_text)
+
     key_words = []
     for x0, y0, x1, y1, w, *_ in page.get_text("words", clip=match_cell) or []:
         wn = norm_text(w)
@@ -552,6 +555,9 @@ def extract_tag_by_cell_adjacency_candidates(
     match_cell, debug = find_cell_by_candidates(page, candidates, verticals, horizontals)
     if not match_cell:
         return None, debug
+
+    label_text = get_cell_text(page, match_cell)
+    debug["cell_norm"] = norm_text(label_text)
 
     key_words = []
     for x0, y0, x1, y1, w, *_ in page.get_text("words", clip=match_cell) or []:
@@ -789,6 +795,21 @@ def extract_candidates_in_cell_text(text: str, regex_pattern: str) -> list[str]:
         seen.add(value)
         candidates.append(value)
     return candidates
+
+
+def extract_value_by_regex(value_raw: str, pattern: str) -> str:
+    if not pattern:
+        return value_raw
+    rx = re.compile(pattern, re.IGNORECASE)
+    match = rx.search(value_raw or "")
+    if not match:
+        return ""
+    if match.groups():
+        for group in match.groups():
+            if group:
+                return group
+        return ""
+    return match.group(0)
 
 
 def template_fingerprint(preset_name: str, key_norm: str, direction: str, value_regex: str) -> str:
@@ -1324,6 +1345,7 @@ __all__ = [
     "extract_tag_candidates_from_text",
     "extract_tag_candidates_first_page",
     "extract_candidates_in_cell_text",
+    "extract_value_by_regex",
     "fit_text_to_box",
     "find_cell_by_candidates",
     "find_adjacent_cell_with_tolerance",
