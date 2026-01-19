@@ -35,7 +35,13 @@ APP_NAME = "ITR 自动预填工具"
 APP_VERSION = "V1.0.3"
 
 from itr_modules.shared.paths import BASE_DIR, ensure_output_dir, ensure_report_dir, get_batch_id, open_in_file_explorer
-from itr_modules.shared.pdf_utils import fit_text_to_box
+from itr_modules.shared.pdf_utils import (
+    extract_tag_by_cell_adjacency,
+    extract_tag_candidates_first_page,
+    fit_text_to_box,
+    is_valid_tag_value,
+    norm_text,
+)
 
 PRESETS_DIR = os.path.join(BASE_DIR, "presets")
 MODULE_NAME = "itr_autofill"
@@ -51,6 +57,8 @@ ensure_report_dir(MODULE_NAME, get_batch_id())
 
 DEFAULT_PAGE1_MARK_RE = re.compile(r"Page\s*1\s*of\s*(\d+)", re.IGNORECASE)
 DEFAULT_TAG_RE = re.compile(r"TAG\s*NO\.\s*:\s*([A-Za-z0-9\-\._/]+)", re.IGNORECASE)
+DEFAULT_TAG_CANDIDATE_PATTERN = r"([A-Za-z0-9][A-Za-z0-9\-\._/]{3,50})"
+TAG_DIRECTION_OPTIONS = ["RIGHT", "DOWN"]
 
 SIDE_OPTIONS = ["", "LEFT", "RIGHT"]
 RULE_OPTIONS = ["", "SHEET_NAME", "PDF_NAME", "TODAY", "EMPTY"]
@@ -147,6 +155,7 @@ def default_preset() -> dict:
         "match": {
             "key_name": "TAG",
             "pdf_extract_regex": r"TAG\s*NO\.\s*:\s*([A-Za-z0-9\-\._/]+)",
+            "tag_direction": "RIGHT",
             "strip_suffixes": ["-EX"],  # 例如 PDF 里是 627-xx-Ex，而 Excel 里是 627-xx
             "excel_key_col_candidates_norm": ["TAGNO", "TAG", "TAGNUMBER", "EQUIPMENTTAG"],
             "enable_fuzzy": True,
@@ -670,6 +679,7 @@ class ITRItem:
     excel_key: str
     sheet_name: str
     filled: Dict[str, str]
+    tag_source: str
 
 
 def write_one_itr(
@@ -768,6 +778,7 @@ class ITRAutofillTab(ttk.Frame):
 
         self.items: List[ITRItem] = []
         self.current_idx: int = -1
+        self.tag_choice_cache: Dict[str, dict] = {}
 
         self._active_entry: Optional[tk.Entry] = None
         self._active_item_id: Optional[str] = None
@@ -908,6 +919,12 @@ class ITRAutofillTab(ttk.Frame):
         self.ent_pdf_key_re = ttk.Entry(mk1, width=60)
         self.ent_pdf_key_re.pack(side="left", padx=8)
 
+        ttk.Label(mk1, text="Tag 值方向").pack(side="left", padx=(20, 4))
+        self.tag_direction_var = tk.StringVar(value="RIGHT")
+        ttk.OptionMenu(mk1, self.tag_direction_var, self.tag_direction_var.get(), *TAG_DIRECTION_OPTIONS).pack(
+            side="left"
+        )
+
         mk2 = ttk.Frame(mk)
         mk2.pack(fill="x", padx=10, pady=6)
         ttk.Label(mk2, text="去除后缀(逗号分隔)").pack(side="left")
@@ -978,6 +995,7 @@ class ITRAutofillTab(ttk.Frame):
         for ent in entries:
             ent.bind("<KeyRelease>", lambda _e: self._mark_preset_modified())
         self.var_enable_fuzzy.trace_add("write", lambda *_: self._mark_preset_modified())
+        self.tag_direction_var.trace_add("write", lambda *_: self._mark_preset_modified())
         self.var_require_confirm.trace_add("write", lambda *_: self._mark_preset_modified())
 
     def _mark_preset_modified(self):
@@ -1047,6 +1065,7 @@ class ITRAutofillTab(ttk.Frame):
         self.ent_key_name.insert(0, str(m.get("key_name", "TAG")))
         self.ent_pdf_key_re.delete(0, tk.END)
         self.ent_pdf_key_re.insert(0, str(m.get("pdf_extract_regex", default_preset()["match"]["pdf_extract_regex"])))
+        self.tag_direction_var.set(str(m.get("tag_direction", "RIGHT")).upper())
         self.ent_strip_suf.delete(0, tk.END)
         self.ent_strip_suf.insert(0, ",".join(m.get("strip_suffixes", ["-EX"])))
         self.ent_key_cols.delete(0, tk.END)
@@ -1169,6 +1188,7 @@ class ITRAutofillTab(ttk.Frame):
         d["match"]["pdf_extract_regex"] = self.ent_pdf_key_re.get().strip() or default_preset()["match"][
             "pdf_extract_regex"
         ]
+        d["match"]["tag_direction"] = (self.tag_direction_var.get() or "RIGHT").upper()
         d["match"]["strip_suffixes"] = [x.strip() for x in self.ent_strip_suf.get().split(",") if x.strip()]
         d["match"]["excel_key_col_candidates_norm"] = [x.strip() for x in self.ent_key_cols.get().split(",") if x.strip()]
         d["match"]["enable_fuzzy"] = bool(self.var_enable_fuzzy.get())
@@ -1470,6 +1490,36 @@ class ITRAutofillTab(ttk.Frame):
             self.pdf_paths = list(paths)
             self.lbl_pdfs.config(text=f"{len(self.pdf_paths)} 个PDF")
 
+    def gui_tag_candidate_chooser(self, pdf_name: str, candidates: List[dict]) -> str:
+        win = tk.Toplevel(self)
+        win.title("Tag 候选选择")
+        win.geometry("600x420")
+
+        ttk.Label(win, text=f"PDF: {pdf_name}").pack(anchor="w", padx=10, pady=(10, 2))
+        ttk.Label(win, text="请选择一个 Tag 候选：").pack(anchor="w", padx=10, pady=(0, 8))
+
+        lb = tk.Listbox(win, height=12, width=80)
+        lb.pack(fill="both", expand=True, padx=10, pady=6)
+        values = [c.get("value", "") for c in candidates]
+        for v in values:
+            lb.insert(tk.END, v)
+
+        chosen = {"val": ""}
+
+        def pick():
+            sel = lb.curselection()
+            if not sel:
+                messagebox.showwarning("提示", "请先选择一个候选")
+                return
+            chosen["val"] = values[sel[0]]
+            win.destroy()
+
+        ttk.Button(win, text="确定", command=pick).pack(pady=8)
+        win.grab_set()
+        self.wait_window(win)
+
+        return chosen["val"]
+
     def gui_fuzzy_chooser(self, key_pdf: str, short_key: str, candidates: List[str]) -> str:
         win = tk.Toplevel(self)
         win.title("模糊匹配确认")
@@ -1548,6 +1598,47 @@ class ITRAutofillTab(ttk.Frame):
         self._preview_thread.start()
         self.after(120, self._poll_preview_queue)
 
+    def _tag_cache_key(self, pdf_path: str, start_page: int) -> str:
+        return f"{pdf_path}::p{start_page}"
+
+    def _extract_tag_candidates_for_itr(self, doc: fitz.Document, start_page: int, pattern: str) -> List[dict]:
+        temp = fitz.open()
+        temp.insert_pdf(doc, from_page=start_page - 1, to_page=start_page - 1)
+        try:
+            return extract_tag_candidates_first_page(temp, pattern)
+        finally:
+            temp.close()
+
+    def _resolve_itr_tag(self, doc: fitz.Document, pdf_path: str, start_page: int, preset: dict) -> Tuple[str, str]:
+        cache_key = self._tag_cache_key(pdf_path, start_page)
+        cached = self.tag_choice_cache.get(cache_key)
+        if cached and cached.get("value"):
+            return cached["value"], cached.get("source", "regex_manual")
+
+        matchkey_norm = norm_text(preset.get("match", {}).get("key_name", "TAG"))
+        direction = (preset.get("match", {}).get("tag_direction", "RIGHT") or "RIGHT").upper()
+        page1 = doc[start_page - 1]
+        tag_value, _debug = extract_tag_by_cell_adjacency(page1, matchkey_norm, direction)
+        if tag_value and is_valid_tag_value(tag_value):
+            self.tag_choice_cache[cache_key] = {"value": tag_value, "source": "cell_adjacency"}
+            return tag_value, "cell_adjacency"
+
+        regex_pattern = preset.get("match", {}).get("pdf_extract_regex", "") or DEFAULT_TAG_CANDIDATE_PATTERN
+        candidates = self._extract_tag_candidates_for_itr(doc, start_page, regex_pattern)
+        if not candidates:
+            return "", "missing"
+        if len(candidates) == 1:
+            value = candidates[0].get("value", "")
+            if value:
+                self.tag_choice_cache[cache_key] = {"value": value, "source": "regex_auto"}
+            return value, "regex_auto"
+
+        value = self._thread_tag_candidate_chooser(os.path.basename(pdf_path), candidates)
+        if value:
+            self.tag_choice_cache[cache_key] = {"value": value, "source": "regex_manual"}
+            return value, "regex_manual"
+        return "", "missing"
+
     def _preview_worker(self, preset: dict):
         try:
             excel_index = build_excel_index(self.excel_path, preset)
@@ -1576,10 +1667,16 @@ class ITRAutofillTab(ttk.Frame):
 
             for start_page in starts_set:
                 try:
-                    page1 = doc[start_page - 1]
+                    doc[start_page - 1]
                 except Exception:
                     continue
-                key_pdf = extract_match_key_from_page(page1, preset)
+                key_pdf, tag_source = self._resolve_itr_tag(doc, pdf_path, start_page, preset)
+                if key_pdf:
+                    key_pdf = norm_key_value(key_pdf)
+                    for suf in preset.get("match", {}).get("strip_suffixes", []):
+                        suf_up = norm_key_value(suf)
+                        if suf_up and key_pdf.endswith(suf_up):
+                            key_pdf = key_pdf[: -len(suf_up)]
 
                 status, excel_key, sheet, payload, short_key = match_one(
                     key_pdf,
@@ -1599,6 +1696,7 @@ class ITRAutofillTab(ttk.Frame):
                         excel_key=excel_key,
                         sheet_name="",
                         filled=filled,
+                        tag_source=tag_source,
                     )
                 else:
                     sheet_name, row_dict, col_map_norm = payload
@@ -1611,6 +1709,7 @@ class ITRAutofillTab(ttk.Frame):
                         excel_key=excel_key,
                         sheet_name=sheet_name,
                         filled=filled,
+                        tag_source=tag_source,
                     )
                 items.append(item)
 
@@ -1619,6 +1718,13 @@ class ITRAutofillTab(ttk.Frame):
             self._preview_q.put(("progress", done_files, total_files, pdf_name))
 
         self._preview_q.put(("done", items, excel_index))
+
+    def _thread_tag_candidate_chooser(self, pdf_name: str, candidates: List[dict]) -> str:
+        event = threading.Event()
+        box = {"val": ""}
+        self._preview_q.put(("tag_request", pdf_name, candidates, box, event))
+        event.wait()
+        return box["val"]
 
     def _thread_fuzzy_chooser(self, key_pdf: str, short_key: str, candidates: List[str]) -> str:
         event = threading.Event()
@@ -1642,6 +1748,11 @@ class ITRAutofillTab(ttk.Frame):
                     pick = self.gui_fuzzy_chooser(key_pdf, short_key, candidates)
                     box["val"] = pick
                     event.set()
+                elif kind == "tag_request":
+                    pdf_name, candidates, box, event = msg[1:]
+                    pick = self.gui_tag_candidate_chooser(pdf_name, candidates)
+                    box["val"] = pick
+                    event.set()
                 elif kind == "done":
                     items, excel_index = msg[1], msg[2]
                     self.excel_index = excel_index
@@ -1653,7 +1764,7 @@ class ITRAutofillTab(ttk.Frame):
                     for i, it in enumerate(self.items):
                         txt = (
                             f"{i + 1:03d} | {it.pdf_file} | start p{it.set_start_page_1based:>3} | "
-                            f"key={it.key_pdf} | {it.match_status} | {it.excel_key}"
+                            f"key={it.key_pdf} ({it.tag_source}) | {it.match_status} | {it.excel_key}"
                         )
                         self.listbox.insert(tk.END, txt)
 
@@ -1707,7 +1818,10 @@ class ITRAutofillTab(ttk.Frame):
         for k in order:
             self.tree.insert("", tk.END, values=(k, it.filled.get(k, "")))
         self.status.config(
-            text=f"当前：{it.pdf_file} | start p{it.set_start_page_1based} | {it.key_pdf} | {it.match_status}"
+            text=(
+                f"当前：{it.pdf_file} | start p{it.set_start_page_1based} | "
+                f"{it.key_pdf} ({it.tag_source}) | {it.match_status}"
+            )
         )
 
     def _commit_active_editor_if_any(self):

@@ -150,6 +150,57 @@ def norm_text(s: str) -> str:
     return re.sub(r"[^A-Z0-9]+", "", (s or "").upper())
 
 
+def is_valid_tag_value(s: str) -> bool:
+    if s is None:
+        return False
+    val = str(s).strip()
+    if not val:
+        return False
+    if len(val) < 4 or len(val) > 50:
+        return False
+    if val.upper() in {"OK", "NA", "PL"}:
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9\-\._/]+", val))
+
+
+def extract_tag_candidates_first_page(doc: fitz.Document, regex_pattern: str) -> list[dict]:
+    try:
+        rx = re.compile(regex_pattern, re.IGNORECASE)
+    except re.error:
+        rx = re.compile(r"([A-Za-z0-9][A-Za-z0-9\-\._/]{3,50})", re.IGNORECASE)
+
+    page = doc[0]
+    text = page.get_text("text") or ""
+    candidates: list[dict] = []
+    seen = set()
+    for idx, match in enumerate(rx.finditer(text)):
+        value = match.group(1) if match.groups() else match.group(0)
+        if not value:
+            continue
+        value = value.strip()
+        if not is_valid_tag_value(value):
+            continue
+        if value in seen:
+            continue
+        seen.add(value)
+        line_hint = None
+        if text:
+            cursor = 0
+            for line in text.splitlines():
+                next_cursor = cursor + len(line) + 1
+                if cursor <= match.start() <= next_cursor:
+                    line_hint = line.strip()
+                    break
+                cursor = next_cursor
+        candidates.append({
+            "value": value,
+            "page_index": 0,
+            "span_index": idx,
+            "line_hint": line_hint,
+        })
+    return candidates
+
+
 def parse_pages_per_itr_regex(doc: fitz.Document, pattern: str, scan_pages: int) -> int | None:
     """Scan initial pages for 'Page x of y' to infer pages per ITR."""
     try:
@@ -231,6 +282,50 @@ def cell_rect_for_word(word_rect: fitz.Rect, verticals, horizontals) -> fitz.Rec
 
 def get_cell_text(page: fitz.Page, cell: fitz.Rect) -> str:
     return (page.get_text("text", clip=cell) or "").strip()
+
+
+def extract_tag_by_cell_adjacency(
+    page: fitz.Page,
+    matchkey_norm: str,
+    direction: str,
+) -> tuple[str | None, dict]:
+    verticals, horizontals = extract_rulings(page)
+    match_cell = find_cell_by_exact_norm(page, matchkey_norm, verticals, horizontals)
+    debug = {"match_cell": match_cell, "direction": direction}
+    if not match_cell:
+        return None, debug
+
+    xs = _unique_sorted_x_from_verticals(verticals)
+    ys = _uniq_sorted([y for y, _, _ in horizontals])
+    if len(xs) < 2 or len(ys) < 2:
+        return None, debug
+
+    cx = (match_cell.x0 + match_cell.x1) / 2.0
+    cy = (match_cell.y0 + match_cell.y1) / 2.0
+    col_idx = None
+    for i in range(len(xs) - 1):
+        if xs[i] - 1 <= cx <= xs[i + 1] + 1:
+            col_idx = i
+            break
+    row_idx = row_index_from_ys(ys, cy)
+    if col_idx is None or row_idx < 0:
+        return None, debug
+
+    direction = (direction or "RIGHT").upper()
+    value_cell = None
+    if direction == "DOWN":
+        if row_idx + 2 < len(ys):
+            value_cell = fitz.Rect(xs[col_idx], ys[row_idx + 1], xs[col_idx + 1], ys[row_idx + 2])
+    else:
+        if col_idx + 2 < len(xs):
+            value_cell = fitz.Rect(xs[col_idx + 1], ys[row_idx], xs[col_idx + 2], ys[row_idx + 1])
+
+    if not value_cell:
+        return None, debug
+
+    raw = get_cell_text(page, value_cell)
+    debug.update({"value_cell": value_cell, "raw": raw, "norm": norm_text(raw)})
+    return (raw.strip() if raw else None), debug
 
 
 def _norm_join_words(words_in_row) -> str:
@@ -756,7 +851,10 @@ def detect_checkitems_table(
 __all__ = [
     "detect_checkitems_table",
     "draw_checkmark",
+    "extract_tag_by_cell_adjacency",
+    "extract_tag_candidates_first_page",
     "fit_text_to_box",
+    "is_valid_tag_value",
     "norm_text",
     "row_band_from_ys",
 ]
